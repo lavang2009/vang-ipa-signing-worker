@@ -19,7 +19,7 @@ const port = Number(process.env.PORT || 8080);
 const maxIpaBytes = Number(process.env.SIGNING_MAX_IPA_BYTES || 512 * 1024 * 1024);
 const maxCertZipBytes = Number(process.env.SIGNING_MAX_CERT_ZIP_BYTES || 20 * 1024 * 1024);
 const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
-const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 9 * 60 * 1000);
+const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "zsign";
 const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS || "").split(/[;,]/).map((item) => item.trim()).filter(Boolean));
 
@@ -234,7 +234,6 @@ app.post("/v1/sign", authenticate, createWorkDir, upload.fields([{ name: "ipa", 
     if (bundleId && (bundleId.length > 180 || !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId))) throw new Error("Bundle ID không đúng định dạng.");
     if (appName.length > 100) throw new Error("Tên ứng dụng không được dài quá 100 ký tự.");
 
-    await consumeDailyQuota(req.user.uid);
     await assertIpaStructure(ipa.path);
     await ensureZipMagic(certificateZip.path, "ZIP chứng chỉ");
     const zipEntries = await getZipEntries(certificateZip.path);
@@ -244,6 +243,8 @@ app.post("/v1/sign", authenticate, createWorkDir, upload.fields([{ name: "ipa", 
     await extractZipEntry(certificateZip.path, certEntries.p12Entry, p12Path, 10 * 1024 * 1024, "P12/PFX");
     await extractZipEntry(certificateZip.path, certEntries.profileEntry, profilePath, 10 * 1024 * 1024, "MobileProvision");
 
+    // Charge quota only after both uploads and the certificate archive have passed validation.
+    await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
     const args = ["-f", "-k", p12Path];
     if (p12Password) args.push("-p", p12Password);
@@ -305,7 +306,7 @@ app.use(async (error, req, res, _next) => {
 });
 
 const server = app.listen(port, "0.0.0.0", () => console.log(`VANG IPA signing worker listening on ${port}; Firebase ${firebaseReady ? "ready" : "not configured"}.`));
-server.requestTimeout = 12 * 60 * 1000;
+server.requestTimeout = 270_000;
 server.headersTimeout = 60 * 1000;
 
 for (const signal of ["SIGTERM", "SIGINT"]) {

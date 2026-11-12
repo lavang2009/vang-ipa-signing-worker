@@ -29,7 +29,7 @@ SIGNING_TIMEOUT_MS=240000
 - `FIREBASE_SERVICE_ACCOUNT`: JSON service account của đúng Firebase project mà website dùng. Dán JSON dạng một dòng vào Vercel Environment Variables; không commit vào GitHub.
 - `ALLOWED_ORIGINS`: origin đầy đủ của website, không thêm dấu `/` cuối; có thể liệt kê nhiều origin, phân cách bằng dấu phẩy.
 - `SIGNING_DAILY_LIMIT`: số lượt ký tối đa mỗi user/ngày.
-- `SIGNING_TIMEOUT_MS`: mặc định 240 giây để ở trong giới hạn 300 giây của Vercel Hobby khi bật Fluid Compute. Kiểm tra plan và giới hạn thực tế trước khi tăng.
+- `SIGNING_TIMEOUT_MS`: mặc định 240 giây; ứng dụng dừng tiến trình ZSign trước mốc 270 giây để chừa thời gian dọn tệp và trả kết quả. Không tăng nếu chưa xác minh giới hạn thực tế của plan/runtime.
 
 Sau khi worker đã deploy, quay lại website Vercel và đặt:
 
@@ -38,6 +38,10 @@ NEXT_PUBLIC_IPA_SIGNING_WORKER_URL=https://WORKER-DOMAIN.vercel.app
 ```
 
 Sau đó redeploy website.
+
+## Sửa lỗi build ngày 12/11/2026
+
+Hai Dockerfile đã được sửa thứ tự tạo thư mục tạm: trước đây `TMPDIR=/tmp/vang-signing` được khai báo trước `apt-get install ca-certificates`, trong khi thư mục chỉ được tạo ở bước RUN sau đó. Script hậu cài đặt `ca-certificates` gọi `mktemp` và thất bại vì TMPDIR chưa tồn tại (`mktemp: failed to create ... No such file or directory`, `dpkg exit code 100`). Bản sửa cài package với TMPDIR mặc định `/tmp`, tạo `/tmp/vang-signing`, cấp quyền cho `appuser`, rồi mới đặt `ENV TMPDIR`.
 
 ## Kiểm thử cục bộ
 

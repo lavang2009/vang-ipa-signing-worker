@@ -8,9 +8,16 @@ RUN git clone --depth 1 --branch ${ZSIGN_REF} https://github.com/zhlynn/zsign.gi
     && test -x /src/zsign/bin/zsign
 
 FROM node:22-bookworm-slim
-ENV NODE_ENV=production PORT=8080 TMPDIR=/tmp/vang-signing
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates unzip libssl3 && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home appuser
+# Do not set TMPDIR to a non-existent path before apt installs ca-certificates:
+# its post-install script uses mktemp and fails when TMPDIR does not exist.
+ENV NODE_ENV=production PORT=8080 DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates unzip libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --create-home appuser \
+    && mkdir -p /tmp/vang-signing \
+    && chown appuser:appuser /tmp/vang-signing
+ENV TMPDIR=/tmp/vang-signing
 WORKDIR /app
 COPY package.json ./package.json
 RUN npm install --omit=dev --no-audit --no-fund
