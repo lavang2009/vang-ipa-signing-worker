@@ -1,0 +1,11 @@
+node_modules/
+npm-debug.log*
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.mobileprovision
+*.ipa
+*.zip
+.DS_Store

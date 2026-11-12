@@ -1,4 +1,11 @@
+.git
 node_modules
-npm-debug.log
+npm-debug.log*
 .env
 .env.*
+*.p12
+*.pfx
+*.mobileprovision
+*.ipa
+*.zip
+.DS_Store
