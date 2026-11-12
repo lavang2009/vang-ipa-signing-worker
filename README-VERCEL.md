@@ -39,9 +39,11 @@ NEXT_PUBLIC_IPA_SIGNING_WORKER_URL=https://WORKER-DOMAIN.vercel.app
 
 Sau đó redeploy website.
 
-## Sửa lỗi build ngày 12/11/2026
+## Build fixes ngày 12/11/2026
 
-Hai Dockerfile đã được sửa thứ tự tạo thư mục tạm: trước đây `TMPDIR=/tmp/vang-signing` được khai báo trước `apt-get install ca-certificates`, trong khi thư mục chỉ được tạo ở bước RUN sau đó. Script hậu cài đặt `ca-certificates` gọi `mktemp` và thất bại vì TMPDIR chưa tồn tại (`mktemp: failed to create ... No such file or directory`, `dpkg exit code 100`). Bản sửa cài package với TMPDIR mặc định `/tmp`, tạo `/tmp/vang-signing`, cấp quyền cho `appuser`, rồi mới đặt `ENV TMPDIR`.
+1. Sửa thứ tự tạo thư mục tạm: `ca-certificates` được cài khi `TMPDIR` vẫn là `/tmp`; chỉ tạo `/tmp/vang-signing` và đặt `ENV TMPDIR` sau khi cài package. Việc này tránh lỗi `mktemp` / `dpkg exit code 100`.
+2. Builder và runtime hiện cùng dùng `node:22-bookworm-slim` (Debian 12). Trước đây ZSign được biên dịch trong Ubuntu 24.04 rồi chép sang Debian 12, khiến binary yêu cầu `GLIBC_2.38` và `GLIBCXX_3.4.32` mà runtime không có. Bản mới biên dịch trên cùng họ Debian 12 với runtime để tương thích ABI.
+3. Docker build kiểm tra `ldd`, từ chối binary có thư viện hoặc symbol phiên bản bị thiếu, và chạy `zsign --version` trước khi image được chấp nhận.
 
 ## Kiểm thử cục bộ
 

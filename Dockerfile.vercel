@@ -1,6 +1,11 @@
-FROM ubuntu:24.04 AS zsign-builder
+# Build ZSign on the same Debian 12 base as the runtime image.
+# This prevents Ubuntu 24.04 binaries (GLIBC_2.38 / newer GLIBCXX symbols)
+# from being copied into Debian 12, which ships older runtime libraries.
+FROM node:22-bookworm-slim AS zsign-builder
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git g++ make pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git g++ make pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 ARG ZSIGN_REF=master
 RUN git clone --depth 1 --branch ${ZSIGN_REF} https://github.com/zhlynn/zsign.git /src/zsign \
     && cd /src/zsign/build/linux \
