@@ -1,8 +1,10 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
+import { Readable } from "node:stream";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pipeline } from "node:stream/promises";
@@ -12,6 +14,7 @@ import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { validateCertificateArchiveEntries } from "./archive-validation.js";
+import { del, get, issueSignedToken, presignUrl, put } from "@vercel/blob";
 
 const execFileAsync = promisify(execFile);
 const app = express();
@@ -21,6 +24,7 @@ const maxCertZipBytes = Number(process.env.SIGNING_MAX_CERT_ZIP_BYTES || 20 * 10
 const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
+const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS || "").split(/[;,]/).map((item) => item.trim()).filter(Boolean));
 
 function initFirebase() {
@@ -73,13 +77,28 @@ app.use((req, res, next) => {
   next();
 });
 
+// The browser sends only small JSON metadata to the worker; large files move directly through Blob.
+app.use(express.json({ limit: "64kb" }));
+
+app.get("/", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    service: "VANG STORE IPA Signing Worker",
+    status: firebaseReady && zsignReady && blobReady ? "ready" : "not_ready",
+    health: "/healthz",
+    signingEndpoint: "POST /v1/sign-blob",
+    engine: zsignReady ? "zsign" : "unavailable",
+  });
+});
+
 app.get("/healthz", (_req, res) => {
-  const ready = firebaseReady && zsignReady;
+  const ready = firebaseReady && zsignReady && blobReady;
   res.status(ready ? 200 : 503).json({
     ok: ready,
     engine: zsignReady ? "zsign" : "unavailable",
     firebase: firebaseReady,
     zsign: zsignReady,
+    blob: blobReady,
     ...(zsignReady ? { zsignVersion } : { zsignError }),
   });
 });
@@ -215,6 +234,7 @@ function friendlySigningError(error) {
   const raw = error instanceof Error ? error.message : String(error || "");
   const lower = raw.toLowerCase();
   if (raw.startsWith("Bạn đã đạt giới hạn ký IPA")) return raw;
+  if (error?.code === "BLOB_NOT_FOUND") return raw;
   if (error?.code === "SIGNING_TIMEOUT") return "Quá thời gian ký IPA. Hãy thử IPA nhỏ hơn hoặc liên hệ quản trị viên kiểm tra worker.";
   if (error?.code === "SIGNING_FAILED") {
     if (/mac verify error|password|pkcs12|bad decrypt|unable to load private key/.test(lower)) return "Không đọc được P12. Kiểm tra file chứng chỉ và mật khẩu P12 (nếu tệp có mật khẩu).";
@@ -302,6 +322,157 @@ app.post("/v1/sign", authenticate, createWorkDir, upload.fields([{ name: "ipa", 
     });
     res.status(error?.message?.startsWith("Bạn đã đạt giới hạn") ? 429 : 400).json({ error: message });
     await fs.rm(req.workDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+
+const uploadChunkBytes = 3 * 1024 * 1024;
+const uploadUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function validateChunkUpload(fileIdValue, totalValue, uid, kind, maxBytes) {
+  const fileId = String(fileIdValue || "");
+  const totalChunks = Number(totalValue);
+  const maxChunks = Math.ceil(maxBytes / uploadChunkBytes);
+  if (!uploadUuidPattern.test(fileId)) throw new Error(`Mã phiên tải ${kind} không hợp lệ.`);
+  if (!Number.isInteger(totalChunks) || totalChunks < 1 || totalChunks > maxChunks) {
+    throw new Error(`Số phần tải ${kind} không hợp lệ hoặc vượt giới hạn.`);
+  }
+  const paths = Array.from({ length: totalChunks }, (_, index) =>
+    `ipa-signing/${uid}/${kind}/${fileId}/chunk-${index}.part`,
+  );
+  return { fileId, totalChunks, paths };
+}
+
+async function downloadPrivateChunksToFile(pathnames, outputPath, maxBytes, label) {
+  let totalBytes = 0;
+  const source = Readable.from((async function* () {
+    for (const pathname of pathnames) {
+      const blob = await get(pathname, { access: "private", useCache: false });
+      if (!blob || blob.statusCode !== 200 || !blob.stream) {
+        const error = new Error(`Không tìm thấy một phần của ${label} trong kho lưu trữ tạm. Hãy tải tệp lên lại.`);
+        error.code = "BLOB_NOT_FOUND";
+        throw error;
+      }
+      if (Number.isFinite(blob.blob?.size) && blob.blob.size > uploadChunkBytes) {
+        throw new Error(`Một phần của ${label} vượt giới hạn 3 MB.`);
+      }
+      for await (const chunk of Readable.fromWeb(blob.stream)) {
+        totalBytes += chunk.length;
+        if (totalBytes > maxBytes) throw new Error(`${label} vượt giới hạn ${Math.floor(maxBytes / 1024 / 1024)} MB.`);
+        yield chunk;
+      }
+    }
+  })());
+
+  await pipeline(source, createWriteStream(outputPath, { flags: "wx", mode: 0o600 }));
+  const stat = await fs.stat(outputPath);
+  if (!stat.isFile() || stat.size <= 0 || stat.size !== totalBytes || stat.size > maxBytes) {
+    await fs.rm(outputPath, { force: true }).catch(() => {});
+    throw new Error(`${label} rỗng hoặc có dung lượng không hợp lệ.`);
+  }
+  return stat.size;
+}
+
+app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
+  const startedAt = Date.now();
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  let ipaPaths = [];
+  let certificatePaths = [];
+  let auditCode = "UNKNOWN";
+  let ipaSize = 0;
+  let certificateZipSize = 0;
+  const p12Password = String(body.p12Password || "");
+  const bundleId = String(body.bundleId || "").trim();
+  const appName = String(body.appName || "").trim();
+
+  try {
+    if (!blobReady) throw new Error("Signing worker chưa cấu hình Vercel Blob. Hãy thêm BLOB_READ_WRITE_TOKEN và triển khai lại.");
+    const ipaUpload = validateChunkUpload(body.ipaFileId, body.ipaTotalChunks, req.user.uid, "ipa", maxIpaBytes);
+    const certificateUpload = validateChunkUpload(body.certificateFileId, body.certificateTotalChunks, req.user.uid, "certificate", maxCertZipBytes);
+    ipaPaths = ipaUpload.paths;
+    certificatePaths = certificateUpload.paths;
+    if (bundleId && (bundleId.length > 180 || !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId))) {
+      throw new Error("Bundle ID không đúng định dạng.");
+    }
+    if (appName.length > 100) throw new Error("Tên ứng dụng không được dài quá 100 ký tự.");
+
+    const ipaPath = path.join(req.workDir, "input.ipa");
+    const certificateZipPath = path.join(req.workDir, "certificate.zip");
+    ipaSize = await downloadPrivateChunksToFile(ipaPaths, ipaPath, maxIpaBytes, "IPA");
+    certificateZipSize = await downloadPrivateChunksToFile(certificatePaths, certificateZipPath, maxCertZipBytes, "ZIP chứng chỉ");
+
+    await assertIpaStructure(ipaPath);
+    await ensureZipMagic(certificateZipPath, "ZIP chứng chỉ");
+    const zipEntries = await getZipEntries(certificateZipPath);
+    const certEntries = validateCertificateArchiveEntries(zipEntries);
+    const p12Path = path.join(req.workDir, "signing-cert.p12");
+    const profilePath = path.join(req.workDir, "signing-profile.mobileprovision");
+    await extractZipEntry(certificateZipPath, certEntries.p12Entry, p12Path, 10 * 1024 * 1024, "P12/PFX");
+    await extractZipEntry(certificateZipPath, certEntries.profileEntry, profilePath, 10 * 1024 * 1024, "MobileProvision");
+
+    // Consume quota only after all private chunks and the credential archive are validated.
+    await consumeDailyQuota(req.user.uid);
+    const outputPath = path.join(req.workDir, "signed-output.ipa");
+    const args = ["-f", "-k", p12Path];
+    if (p12Password) args.push("-p", p12Password);
+    args.push("-m", profilePath);
+    if (bundleId) args.push("-b", bundleId);
+    if (appName) args.push("-n", appName);
+    args.push("-o", outputPath, "-z", "6", ipaPath);
+
+    try {
+      await runZSign(args);
+    } catch (error) {
+      auditCode = error?.code || "SIGNING_FAILED";
+      const raw = error instanceof Error ? error.message : "";
+      if (p12Password && raw.includes(p12Password)) error.message = raw.split(p12Password).join("[REDACTED]");
+      throw error;
+    }
+
+    const outputStat = await fs.stat(outputPath);
+    if (!outputStat.isFile() || outputStat.size < 4) throw new Error("ZSign không tạo được tệp IPA đầu ra.");
+    await assertIpaStructure(outputPath);
+
+    const sourceLabel = typeof body.originalName === "string" ? body.originalName : "vang-store";
+    const outputName = safeInputName(path.basename(sourceLabel, path.extname(sourceLabel)) + "-signed", "vang-store-signed", ".ipa");
+    const outputBlob = await put(`ipa-signing/${req.user.uid}/signed/${crypto.randomUUID()}-${outputName}`, createReadStream(outputPath), {
+      access: "private",
+      contentType: "application/octet-stream",
+      addRandomSuffix: true,
+      ttlDays: 1,
+      multipart: outputStat.size > 10 * 1024 * 1024,
+    });
+    const validUntil = Date.now() + 20 * 60 * 1000;
+    const signedToken = await issueSignedToken({ pathname: outputBlob.pathname, operations: ["get"], validUntil });
+    const { presignedUrl } = await presignUrl(signedToken, {
+      operation: "get",
+      pathname: outputBlob.pathname,
+      access: "private",
+      validUntil,
+    });
+
+    auditCode = "OK";
+    await writeAudit(req.user.uid, "success", {
+      ipaSize, certificateZipSize, bundleIdChanged: Boolean(bundleId),
+      appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
+    });
+    return res.json({ url: presignedUrl, name: outputName, expiresAt: new Date(validUntil).toISOString() });
+  } catch (error) {
+    auditCode = error?.code || "VALIDATION_OR_SIGNING_ERROR";
+    const message = friendlySigningError(error);
+    await writeAudit(req.user.uid, "failed", {
+      ipaSize, certificateZipSize, bundleIdChanged: Boolean(bundleId),
+      appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt, errorCode: auditCode,
+    });
+    const status = error?.code === "SIGNING_TIMEOUT" ? 504
+      : message.startsWith("Bạn đã đạt giới hạn") ? 429
+      : error?.code === "BLOB_NOT_FOUND" ? 404
+      : 400;
+    return res.status(status).json({ error: message });
+  } finally {
+    const toDelete = [...ipaPaths, ...certificatePaths];
+    if (toDelete.length && blobReady) await del(toDelete).catch((error) => console.error("Could not delete private input chunks:", error instanceof Error ? error.message : "unknown"));
+    if (req.workDir) await fs.rm(req.workDir, { recursive: true, force: true }).catch(() => {});
   }
 });
 
