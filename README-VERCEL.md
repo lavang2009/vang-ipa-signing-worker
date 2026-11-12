@@ -74,3 +74,15 @@ Vercel Container runtime chạy dưới dạng Vercel Function và tuân theo gi
 - Không ghi mật khẩu P12 vào audit log.
 - Worker xóa thư mục làm việc tạm sau khi hoàn thành hoặc lỗi.
 - Chỉ dùng certificate/P12 và provisioning profile mà bạn có quyền sử dụng.
+
+## ZSign readiness troubleshooting
+
+The current `/healthz` endpoint returns a `zsignVersion` field after the engine starts successfully. If it cannot start, it returns a safe `zsignError` code:
+
+- `ENOENT`: the configured executable path does not exist. Check that the active deployment was built from the latest commit and includes `/usr/local/bin/zsign`.
+- `EACCES`: the executable is not accessible to the unprivileged runtime user. The Dockerfile now enforces mode `0755`.
+- A non-zero numeric exit code: the executable started but exited during `--version`; inspect the Vercel Runtime Logs for the full loader or startup error.
+
+The Dockerfile now verifies the copied binary, checks its dynamic library dependencies with `ldd`, and runs `zsign --version` during image build. This deliberately fails the build when ZSign is missing or cannot execute, rather than publishing an unhealthy worker.
+
+Important: if a new deployment fails to build, Vercel continues serving the previous successful production deployment. Confirm the production deployment's commit is the latest `main` commit before interpreting `/healthz`.

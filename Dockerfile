@@ -12,7 +12,7 @@ FROM node:22-bookworm-slim
 # its post-install script uses mktemp and fails when TMPDIR does not exist.
 ENV NODE_ENV=production PORT=8080 DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates unzip libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates unzip libssl3 libstdc++6 libgcc-s1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home appuser \
     && mkdir -p /tmp/vang-signing \
@@ -23,7 +23,16 @@ COPY package.json ./package.json
 RUN npm install --omit=dev --no-audit --no-fund
 COPY src ./src
 COPY --from=zsign-builder /src/zsign/bin/zsign /usr/local/bin/zsign
-RUN chmod 0755 /usr/local/bin/zsign && mkdir -p /tmp/vang-signing && chown -R appuser:appuser /app /tmp/vang-signing
+ENV ZSIGN_BIN=/usr/local/bin/zsign
+# Verify the copied binary and all dynamic libraries during image build,
+# so a broken image cannot be deployed as a seemingly healthy worker.
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/zsign; \
+    ldd /usr/local/bin/zsign | tee /tmp/zsign-ldd.txt; \
+    if grep -q "not found" /tmp/zsign-ldd.txt; then echo "ZSign has missing runtime libraries"; exit 1; fi; \
+    /usr/local/bin/zsign --version; \
+    mkdir -p /tmp/vang-signing; \
+    chown -R appuser:appuser /app /tmp/vang-signing
 USER appuser
 EXPOSE 8080
 CMD ["node", "src/server.js"]

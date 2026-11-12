@@ -20,7 +20,7 @@ const maxIpaBytes = Number(process.env.SIGNING_MAX_IPA_BYTES || 512 * 1024 * 102
 const maxCertZipBytes = Number(process.env.SIGNING_MAX_CERT_ZIP_BYTES || 20 * 1024 * 1024);
 const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
-const zsignBin = process.env.ZSIGN_BIN || "zsign";
+const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS || "").split(/[;,]/).map((item) => item.trim()).filter(Boolean));
 
 function initFirebase() {
@@ -43,8 +43,17 @@ let firebaseReady = false;
 try { initFirebase(); firebaseReady = true; }
 catch (error) { console.error("Firebase Admin initialization failed:", error instanceof Error ? error.message : "unknown"); }
 let zsignReady = false;
-try { await execFileAsync(zsignBin, ["-v"], { encoding: "utf8", timeout: 10_000 }); zsignReady = true; }
-catch (error) { console.error("ZSign engine is unavailable:", error instanceof Error ? error.message : "unknown"); }
+let zsignVersion = null;
+let zsignError = null;
+try {
+  await fs.access(zsignBin, 0o1);
+  const versionResult = await execFileAsync(zsignBin, ["--version"], { encoding: "utf8", timeout: 10_000 });
+  zsignVersion = String(versionResult.stdout || versionResult.stderr || "").trim().slice(0, 100) || "available";
+  zsignReady = true;
+} catch (error) {
+  zsignError = error?.code || "STARTUP_CHECK_FAILED";
+  console.error("ZSign engine is unavailable:", zsignError, error instanceof Error ? error.message : "unknown");
+}
 
 function setCors(req, res) {
   const origin = req.headers.origin;
@@ -71,6 +80,7 @@ app.get("/healthz", (_req, res) => {
     engine: zsignReady ? "zsign" : "unavailable",
     firebase: firebaseReady,
     zsign: zsignReady,
+    ...(zsignReady ? { zsignVersion } : { zsignError }),
   });
 });
 
