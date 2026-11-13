@@ -14,6 +14,7 @@ import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { validateCertificateArchiveEntries } from "./archive-validation.js";
+import { applyCors, parseAllowedOrigins } from "./cors.js";
 import { del, get, issueSignedToken, presignUrl, put } from "@vercel/blob";
 
 const execFileAsync = promisify(execFile);
@@ -27,24 +28,8 @@ const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 const workerBuild = "ipa-sign-blob-cors-diagnostics-2026-11-13";
 
-function normalizeOrigin(value) {
-  try {
-    const parsed = new URL(String(value || "").trim());
-    if (!["http:", "https:"].includes(parsed.protocol)) return "";
-    return parsed.origin;
-  } catch {
-    return "";
-  }
-}
-
-// Accept full origins only. Normalizing with URL.origin removes accidental trailing
-// slashes and paths while keeping the allow-list restricted to explicit hosts.
-const allowedOrigins = new Set(
-  (process.env.ALLOWED_ORIGINS || "")
-    .split(/[;,\n]/)
-    .map(normalizeOrigin)
-    .filter(Boolean),
-);
+// Keep the CORS allow-list strict and independently unit-tested.
+const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
 
 function initFirebase() {
   if (getApps().length) return getApps()[0];
@@ -78,23 +63,12 @@ try {
   console.error("ZSign engine is unavailable:", zsignError, error instanceof Error ? error.message : "unknown");
 }
 
-function setCors(req, res) {
-  const requestOrigin = req.headers.origin;
-  // Server-to-server health diagnostics and command-line checks have no Origin.
-  if (!requestOrigin) return true;
-  const origin = normalizeOrigin(requestOrigin);
-  if (!origin || !allowedOrigins.has(origin)) return false;
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
-  res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, X-Signing-Engine");
-  res.setHeader("Access-Control-Max-Age", "86400");
-  return true;
-}
-
 app.use((req, res, next) => {
-  if (!setCors(req, res)) return res.status(403).json({ error: "Origin này không được phép sử dụng signing worker." });
+  // Server-to-server requests without an Origin remain supported. Browser requests
+  // must match the exact allow-list and receive the headers required for Bearer auth.
+  if (!applyCors(req, res, allowedOrigins)) {
+    return res.status(403).json({ error: "Origin này không được phép sử dụng signing worker." });
+  }
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
