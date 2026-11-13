@@ -15,7 +15,7 @@ Worker chạy ZSign thật, xác thực Firebase ID Token, ghi quota/audit vào 
 ```env
 FIREBASE_SERVICE_ACCOUNT={JSON_SERVICE_ACCOUNT_CUA_FIREBASE_VANG_STORE}
 BLOB_READ_WRITE_TOKEN={TOKEN_CUA_CUNG_PRIVATE_BLOB_STORE}
-ALLOWED_ORIGINS=https://luavang.store,https://www.luavang.store
+ALLOWED_ORIGINS=https://luavang.store
 SIGNING_DAILY_LIMIT=10
 SIGNING_MAX_IPA_BYTES=536870912
 SIGNING_MAX_CERT_ZIP_BYTES=20971520
@@ -24,7 +24,7 @@ SIGNING_TIMEOUT_MS=240000
 
 - `FIREBASE_SERVICE_ACCOUNT`: JSON service account của đúng Firebase project mà website sử dụng. Chỉ lưu trong Vercel Environment Variables; không commit JSON lên GitHub.
 - `BLOB_READ_WRITE_TOKEN`: token được tạo khi kết nối cùng Private Blob Store. Worker và website phải đọc/ghi cùng một store.
-- `ALLOWED_ORIGINS`: origin chính xác của website, phân cách bằng dấu phẩy. Không thêm path hoặc dấu `/` cuối. Xóa domain `www` nếu website không dùng domain đó.
+- `ALLOWED_ORIGINS`: origin chính xác của website, phân cách bằng dấu phẩy. Với domain hiện tại dùng `https://luavang.store`; chỉ thêm `https://www.luavang.store` nếu domain www thực sự đang phục vụ website. Worker chuẩn hóa origin nhưng không mở wildcard. Không thêm path.
 - `SIGNING_DAILY_LIMIT`: giới hạn lượt ký mỗi người dùng mỗi ngày.
 - `SIGNING_TIMEOUT_MS`: timeout ZSign mặc định 240 giây.
 
@@ -44,6 +44,9 @@ Health check sẵn sàng chỉ khi có:
   "firebase": true,
   "zsign": true,
   "blob": true,
+  "signBlob": true,
+  "corsConfigured": true,
+  "build": "ipa-sign-blob-cors-diagnostics-2026-11-13",
   "zsignVersion": "..."
 }
 ```
@@ -60,7 +63,7 @@ Việc chia phần tránh giới hạn request body 4.5 MB cho từng upload chu
 
 ## CORS
 
-Worker xử lý preflight `OPTIONS` và chỉ cho phép origin được chỉ định trong `ALLOWED_ORIGINS`. Website gọi trực tiếp `GET /healthz` và `POST /v1/sign-blob`; vì vậy phải đưa chính xác origin website vào biến này, ví dụ `https://luavang.store` (không phải URL `/sign-ipa`).
+Worker xử lý preflight `OPTIONS` và chỉ cho phép origin được chỉ định trong `ALLOWED_ORIGINS`. Website kiểm tra Worker qua API cùng domain `/api/ipa-signing/health`; API chuyển tiếp origin trình duyệt đến Worker để phát hiện CORS. Lệnh ký `POST /v1/sign-blob` vẫn gọi trực tiếp Worker, vì vậy phải cho phép chính xác `https://luavang.store` (không phải URL `/sign-ipa`). Sau khi sửa biến, redeploy Worker.
 
 ## Kiểm thử cục bộ
 

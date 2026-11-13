@@ -25,7 +25,26 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS || "").split(/[;,]/).map((item) => item.trim()).filter(Boolean));
+const workerBuild = "ipa-sign-blob-cors-diagnostics-2026-11-13";
+
+function normalizeOrigin(value) {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    if (!["http:", "https:"].includes(parsed.protocol)) return "";
+    return parsed.origin;
+  } catch {
+    return "";
+  }
+}
+
+// Accept full origins only. Normalizing with URL.origin removes accidental trailing
+// slashes and paths while keeping the allow-list restricted to explicit hosts.
+const allowedOrigins = new Set(
+  (process.env.ALLOWED_ORIGINS || "")
+    .split(/[;,\n]/)
+    .map(normalizeOrigin)
+    .filter(Boolean),
+);
 
 function initFirebase() {
   if (getApps().length) return getApps()[0];
@@ -60,14 +79,17 @@ try {
 }
 
 function setCors(req, res) {
-  const origin = req.headers.origin;
-  if (!origin) return true; // CLI/health checks; authenticated browser requests always send Origin.
-  if (!allowedOrigins.has(origin)) return false;
+  const requestOrigin = req.headers.origin;
+  // Server-to-server health diagnostics and command-line checks have no Origin.
+  if (!requestOrigin) return true;
+  const origin = normalizeOrigin(requestOrigin);
+  if (!origin || !allowedOrigins.has(origin)) return false;
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   res.setHeader("Access-Control-Expose-Headers", "Content-Disposition, X-Signing-Engine");
+  res.setHeader("Access-Control-Max-Age", "86400");
   return true;
 }
 
@@ -93,12 +115,19 @@ app.get("/", (_req, res) => {
 
 app.get("/healthz", (_req, res) => {
   const ready = firebaseReady && zsignReady && blobReady;
+  res.setHeader("Cache-Control", "no-store, max-age=0");
   res.status(ready ? 200 : 503).json({
     ok: ready,
+    service: "VANG STORE IPA Signing Worker",
+    build: workerBuild,
     engine: zsignReady ? "zsign" : "unavailable",
     firebase: firebaseReady,
     zsign: zsignReady,
     blob: blobReady,
+    signBlob: true,
+    corsConfigured: allowedOrigins.size > 0,
+    allowedOriginCount: allowedOrigins.size,
+    signingEndpoint: "POST /v1/sign-blob",
     ...(zsignReady ? { zsignVersion } : { zsignError }),
   });
 });
@@ -486,7 +515,10 @@ app.use(async (error, req, res, _next) => {
   return res.status(500).json({ error: "Signing worker gặp lỗi nội bộ. Vui lòng thử lại sau." });
 });
 
-const server = app.listen(port, "0.0.0.0", () => console.log(`VANG IPA signing worker listening on ${port}; Firebase ${firebaseReady ? "ready" : "not configured"}.`));
+const server = app.listen(port, "0.0.0.0", () => {
+  console.log(`VANG IPA signing worker listening on ${port}; Firebase ${firebaseReady ? "ready" : "not configured"}; ZSign ${zsignReady ? "ready" : "not ready"}; Blob ${blobReady ? "ready" : "not configured"}; CORS origins ${allowedOrigins.size}.`);
+  if (allowedOrigins.size === 0) console.error("ALLOWED_ORIGINS is empty. Browser signing requests will be rejected by CORS.");
+});
 server.requestTimeout = 270_000;
 server.headersTimeout = 60 * 1000;
 
