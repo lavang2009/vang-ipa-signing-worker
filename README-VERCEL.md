@@ -101,3 +101,12 @@ The worker now requires the `openssl` CLI and the `plist` Node package to inspec
 For a valid Ad Hoc profile, `POST /v1/sign-blob` returns the private signed-IPA URL plus an expiring `manifestUrl` and `installUrl` (`itms-services`). The manifest is generated from the signed IPA's Bundle ID/version and includes only the signed IPA URL and standard app metadata. The user may submit an optional 40-hex-character `deviceUdid`; the Worker checks it against `ProvisionedDevices` and never logs or stores the UDID. If omitted, the UI warns that the target device must still be listed in the profile. Development/App Store profiles do not receive an Ad Hoc installation link.
 
 Signed IPA and manifest URLs expire after 60 minutes. The underlying private Blob objects expire after one day. The download link remains available as a fallback. OTA behavior should be verified on the intended iOS versions; Apple documents Ad Hoc installation for registered devices through Xcode Device Hub or Apple Configurator, and its wireless web-distribution guide describes In-House profiles.
+
+
+## Provisioning Profile CMS decoder fix (2026-11-15)
+
+The worker decodes `.mobileprovision` using OpenSSL `cms -verify -binary -inform DER -noverify` first, then falls back to `smime` and PEM input compatibility. `-noverify` skips certificate-chain trust lookup only; OpenSSL still checks the CMS signed content. The decoded plist is parsed and checked for expected provisioning-profile fields.
+
+If decoding fails, Runtime Logs include the OpenSSL strategy, exit code and a shortened diagnostic, without logging the profile content, UDIDs, P12, token or password. The API distinguishes CMS failure, malformed plist and incomplete profile. The profile itself remains private in the worker's temporary directory and is deleted after signing.
+
+Test locally with `npm test`; the CMS decoder tests generate a temporary synthetic profile signed by a disposable test certificate and never use production credentials.

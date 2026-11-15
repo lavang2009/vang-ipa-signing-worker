@@ -14,6 +14,7 @@ import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { parse as parsePlist } from "plist";
+import { decodeProvisioningProfile } from "./provisioning-profile.js";
 import { validateCertificateArchiveEntries } from "./archive-validation.js";
 import { applyCors, buildAllowedOrigins } from "./cors.js";
 import {
@@ -36,7 +37,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-ad-hoc-ota-install-2026-11-15";
+const workerBuild = "ipa-profile-cms-decoder-fix-2026-11-15";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -233,24 +234,6 @@ async function extractZipEntry(zipPath, entryName, outputPath, maxBytes, label) 
   await fs.writeFile(outputPath, stdout, { flag: "wx", mode: 0o600 });
 }
 
-async function decodeProvisioningProfile(profilePath) {
-  try {
-    const result = await execFileAsync("openssl", [
-      "smime", "-inform", "DER", "-verify", "-noverify", "-in", profilePath,
-    ], { encoding: null, maxBuffer: 12 * 1024 * 1024, timeout: 30_000 });
-    const profile = parsePlist(new Uint8Array(result.stdout));
-    if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
-      throw new Error("Provisioning Profile không chứa plist dictionary hợp lệ.");
-    }
-    return profile;
-  } catch (error) {
-    const wrapped = new Error("Không giải mã được Provisioning Profile. Hãy kiểm tra file .mobileprovision có hợp lệ và không bị hỏng.");
-    wrapped.code = "INVALID_PROVISIONING_PROFILE";
-    wrapped.cause = error;
-    throw wrapped;
-  }
-}
-
 async function readIpaAppMetadata(ipaPath) {
   const entries = await getZipEntries(ipaPath, 8 * 1024 * 1024);
   const infoEntries = entries.filter((entry) => /^Payload\/[^/]+\.app\/Info\.plist$/i.test(entry.replace(/^\.\//, "")));
@@ -353,7 +336,10 @@ function friendlySigningError(error) {
     if (/provision|profile|entitlement|bundle identifier|application-identifier/.test(lower)) return "Provisioning profile không tương thích với chứng chỉ, Bundle ID hoặc quyền của ứng dụng.";
     return "ZSign không thể ký IPA này. Hãy kiểm tra chứng chỉ còn hạn, profile phù hợp và thử lại bằng bộ tệp hợp lệ.";
   }
-  if (error?.code === "INVALID_PROVISIONING_PROFILE") return raw;
+  if (error?.code === "INVALID_PROVISIONING_PROFILE_CMS") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_CMS). Kiểm tra log Worker theo thời điểm ký để xem kết quả OpenSSL CMS.`;
+  if (error?.code === "INVALID_PROVISIONING_PROFILE_PLIST") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_PLIST). Lớp CMS đọc được nhưng nội dung plist không hợp lệ.`;
+  if (error?.code === "INCOMPLETE_PROVISIONING_PROFILE") return `${raw} (Mã: INCOMPLETE_PROVISIONING_PROFILE). Tải lại profile trực tiếp từ Apple Developer.`;
+  if (error?.code === "INVALID_PROVISIONING_PROFILE_SIZE") return raw;
   if (error?.code === "ENOENT") return "Signing worker thiếu chương trình unzip, OpenSSL hoặc ZSign. Hãy liên hệ quản trị viên.";
   return raw || "Không thể xử lý tệp ký IPA.";
 }
