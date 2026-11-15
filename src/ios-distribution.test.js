@@ -6,8 +6,6 @@ import {
   buildOtaManifestXml,
   classifyProvisioningProfile,
   isBundleIdentifierAllowed,
-  isDeviceRegistered,
-  normalizeDeviceUdid,
 } from "./ios-distribution.js";
 
 const future = new Date(Date.now() + 86_400_000);
@@ -40,9 +38,8 @@ test("classifies enterprise and development profiles", () => {
 });
 
 test("rejects expired or unidentified provisioning profiles", () => {
-  assert.throws(() => assertProvisioningProfileUsable({ type: "unknown", expiresAt: future.toISOString() }), /Không xác định/);
-  assert.throws(() => assertProvisioningProfileUsable({ type: "ad-hoc", registeredDeviceCount: 1, expiresAt: new Date(0).toISOString() }), /đã hết hạn/);
-  assert.throws(() => assertProvisioningProfileUsable({ type: "ad-hoc", registeredDeviceCount: 0, expiresAt: future.toISOString() }), /không có thiết bị/);
+  assert.throws(() => assertProvisioningProfileUsable({ type: "other", applicationIdentifier: "ABCDE12345.com.example.app", expiresAt: new Date(0).toISOString() }), /đã hết hạn/);
+  assert.throws(() => assertProvisioningProfileUsable({ type: "ad-hoc", registeredDeviceCount: 1, expiresAt: future.toISOString() }), /application-identifier/);
 });
 
 test("matches exact and wildcard App IDs", () => {
@@ -52,13 +49,38 @@ test("matches exact and wildcard App IDs", () => {
   assert.equal(isBundleIdentifierAllowed("ABCDE12345.*", "com.example.app"), true);
 });
 
-test("normalizes and validates a supplied device UDID", () => {
-  assert.equal(normalizeDeviceUdid(udidA.toLowerCase()), udidA);
-  assert.equal(normalizeDeviceUdid(""), "");
-  assert.throws(() => normalizeDeviceUdid("1234"), /40 ký tự/);
-  const info = classifyProvisioningProfile(adhocProfile());
-  assert.equal(isDeviceRegistered(info, udidA), true);
-  assert.equal(isDeviceRegistered(info, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"), false);
+
+
+test("keeps Ad Hoc and Development device restrictions in the profile without asking for a client UDID", () => {
+  const adHoc = classifyProvisioningProfile(adhocProfile());
+  const development = classifyProvisioningProfile(adhocProfile({ Entitlements: {
+    "get-task-allow": true,
+    "application-identifier": "ABCDE12345.com.example.app",
+  } }));
+  assert.equal(adHoc.type, "ad-hoc");
+  assert.equal(adHoc.registeredDeviceCount, 2);
+  assert.equal(development.type, "development");
+  assert.equal(development.registeredDeviceCount, 2);
+  // No target UDID is collected or checked by the website/worker. iOS enforces
+  // the device list embedded in the signed provisioning profile at install time.
+});
+
+test("classifies every standard iOS profile type for signing", () => {
+  assert.equal(classifyProvisioningProfile(adhocProfile()).type, "ad-hoc");
+  assert.equal(classifyProvisioningProfile({ ProvisionsAllDevices: true, ExpirationDate: future, Entitlements: { "application-identifier": "ABCDE12345.com.example.app" } }).type, "enterprise");
+  assert.equal(classifyProvisioningProfile({ ProvisionedDevices: [udidA], Entitlements: { "get-task-allow": true }, ExpirationDate: future }).type, "development");
+  assert.equal(classifyProvisioningProfile({ Entitlements: { "get-task-allow": false }, ExpirationDate: future }).type, "app-store");
+  assert.equal(classifyProvisioningProfile({ Entitlements: {}, ExpirationDate: future }).type, "other");
+});
+
+test("allows valid non-Ad Hoc profiles to pass profile eligibility checks", () => {
+  for (const type of ["enterprise", "development", "app-store", "other"]) {
+    assert.equal(assertProvisioningProfileUsable({
+      type,
+      expiresAt: future.toISOString(),
+      applicationIdentifier: "ABCDE12345.com.example.app",
+    }).type, type);
+  }
 });
 
 test("builds a valid OTA manifest with escaped values", () => {

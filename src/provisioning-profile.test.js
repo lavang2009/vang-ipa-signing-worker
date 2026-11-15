@@ -63,13 +63,58 @@ test("rejects a tampered CMS profile with a precise error code", { skip: !hasOpe
   });
 });
 
+test("decodes PEM-encoded CMS provisioning profiles", { skip: !hasOpenSsl }, async (t) => {
+  const { dir, profilePath } = await makeFixture(t);
+  const pemPath = path.join(dir, "fixture-pem.mobileprovision");
+  execFileSync("openssl", ["cms", "-cmsout", "-inform", "DER", "-in", profilePath, "-outform", "PEM", "-out", pemPath], { stdio: "ignore" });
+  const profile = await decodeProvisioningProfile(pemPath);
+  assert.equal(profile.Name, "Fixture Ad Hoc");
+});
+
+test("decodes an S/MIME CMS provisioning profile", { skip: !hasOpenSsl }, async (t) => {
+  const { dir, profilePath } = await makeFixture(t);
+  const smimePath = path.join(dir, "fixture-smime.mobileprovision");
+  execFileSync("openssl", ["cms", "-cmsout", "-inform", "DER", "-in", profilePath, "-outform", "SMIME", "-out", smimePath], { stdio: "ignore" });
+  const profile = await decodeProvisioningProfile(smimePath);
+  assert.equal(profile.Name, "Fixture Ad Hoc");
+});
+
+test("decodes a base64-wrapped DER CMS profile", { skip: !hasOpenSsl }, async (t) => {
+  const { dir, profilePath } = await makeFixture(t);
+  const base64Path = path.join(dir, "fixture-base64.mobileprovision");
+  await fs.writeFile(base64Path, (await fs.readFile(profilePath)).toString("base64"));
+  const profile = await decodeProvisioningProfile(base64Path);
+  assert.equal(profile.Name, "Fixture Ad Hoc");
+});
+
+test("verifies Apple's nested DER-Encoded-Profile CMS when present", { skip: !hasOpenSsl }, async (t) => {
+  const { dir } = await makeFixture(t);
+  const innerData = path.join(dir, "inner-der.bin");
+  const innerCms = path.join(dir, "inner-profile.der");
+  const outerPlist = path.join(dir, "outer.plist");
+  const outerProfile = path.join(dir, "outer.mobileprovision");
+  // A small valid ASN.1 DER SEQUENCE payload, wrapped in its own CMS SignedData.
+  await fs.writeFile(innerData, Buffer.from([0x30, 0x03, 0x02, 0x01, 0x01]));
+  const keyPath = path.join(dir, "signer.key");
+  const certPath = path.join(dir, "signer.crt");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-keyout", keyPath, "-out", certPath, "-days", "2", "-nodes", "-subj", "/CN=VANG Test Nested Signer"], { stdio: "ignore" });
+  execFileSync("openssl", ["cms", "-sign", "-binary", "-in", innerData, "-signer", certPath, "-inkey", keyPath, "-outform", "DER", "-out", innerCms, "-nodetach"], { stdio: "ignore" });
+  const nestedBase64 = (await fs.readFile(innerCms)).toString("base64");
+  const outer = samplePlist.replace("<key>Name</key><string>Fixture Ad Hoc</string>", `<key>Name</key><string>Fixture Ad Hoc</string><key>DER-Encoded-Profile</key><string>${nestedBase64}</string>`);
+  await fs.writeFile(outerPlist, outer);
+  execFileSync("openssl", ["cms", "-sign", "-binary", "-in", outerPlist, "-signer", certPath, "-inkey", keyPath, "-outform", "DER", "-out", outerProfile, "-nodetach"], { stdio: "ignore" });
+  const profile = await decodeProvisioningProfile(outerProfile);
+  assert.equal(profile.Name, "Fixture Ad Hoc");
+  assert.equal(typeof profile["DER-Encoded-Profile"], "string");
+});
+
 test("rejects a plain plist file because it has no Apple CMS wrapper", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "profile-plain-test-"));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const profilePath = path.join(dir, "plain.mobileprovision");
   await fs.writeFile(profilePath, samplePlist);
   await assert.rejects(decodeProvisioningProfile(profilePath), (error) => {
-    assert.equal(error.code, "INVALID_PROVISIONING_PROFILE_CMS");
+    assert.equal(error.code, "UNSIGNED_PROVISIONING_PROFILE");
     assert.match(error.message, /plist thô/);
     return true;
   });

@@ -23,8 +23,6 @@ import {
   buildOtaManifestXml,
   classifyProvisioningProfile,
   isBundleIdentifierAllowed,
-  isDeviceRegistered,
-  normalizeDeviceUdid,
 } from "./ios-distribution.js";
 import { del, get, issueSignedToken, presignUrl, put } from "@vercel/blob";
 
@@ -37,7 +35,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-profile-cms-decoder-fix-2026-11-15";
+const workerBuild = "ipa-all-profiles-cms-compatible-no-udid-input-2026-11-16";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -336,9 +334,11 @@ function friendlySigningError(error) {
     if (/provision|profile|entitlement|bundle identifier|application-identifier/.test(lower)) return "Provisioning profile không tương thích với chứng chỉ, Bundle ID hoặc quyền của ứng dụng.";
     return "ZSign không thể ký IPA này. Hãy kiểm tra chứng chỉ còn hạn, profile phù hợp và thử lại bằng bộ tệp hợp lệ.";
   }
-  if (error?.code === "INVALID_PROVISIONING_PROFILE_CMS") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_CMS). Kiểm tra log Worker theo thời điểm ký để xem kết quả OpenSSL CMS.`;
-  if (error?.code === "INVALID_PROVISIONING_PROFILE_PLIST") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_PLIST). Lớp CMS đọc được nhưng nội dung plist không hợp lệ.`;
-  if (error?.code === "INCOMPLETE_PROVISIONING_PROFILE") return `${raw} (Mã: INCOMPLETE_PROVISIONING_PROFILE). Tải lại profile trực tiếp từ Apple Developer.`;
+  if (error?.code === "INVALID_PROVISIONING_PROFILE_CMS") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_CMS). Worker đã thử CMS DER, PEM và S/MIME; xem Runtime Logs để biết lỗi OpenSSL cụ thể.`;
+  if (error?.code === "INVALID_DER_ENCODED_PROFILE") return `${raw} (Mã: INVALID_DER_ENCODED_PROFILE). Phần DER-Encoded-Profile của profile không hợp lệ hoặc không xác minh được.`;
+  if (error?.code === "UNSIGNED_PROVISIONING_PROFILE") return `${raw} (Mã: UNSIGNED_PROVISIONING_PROFILE). Worker chỉ chấp nhận profile CMS gốc đã được Apple ký.`;
+  if (error?.code === "INVALID_PROVISIONING_PROFILE_PLIST") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_PLIST). CMS hợp lệ nhưng payload bên trong không phải plist mà Worker đọc được.`;
+  if (error?.code === "INCOMPLETE_PROVISIONING_PROFILE") return `${raw} (Mã: INCOMPLETE_PROVISIONING_PROFILE). Profile thiếu trường bắt buộc; hãy tải lại từ Apple Developer.`;
   if (error?.code === "INVALID_PROVISIONING_PROFILE_SIZE") return raw;
   if (error?.code === "ENOENT") return "Signing worker thiếu chương trình unzip, OpenSSL hoặc ZSign. Hãy liên hệ quản trị viên.";
   return raw || "Không thể xử lý tệp ký IPA.";
@@ -515,11 +515,6 @@ app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
     const provisioningProfileInfo = assertProvisioningProfileUsable(
       classifyProvisioningProfile(rawProvisioningProfile),
     );
-    const requestedDeviceUdid = normalizeDeviceUdid(body.deviceUdid);
-    if (requestedDeviceUdid && provisioningProfileInfo.type === "ad-hoc" && !isDeviceRegistered(provisioningProfileInfo, requestedDeviceUdid)) {
-      throw new Error("UDID iPhone bạn nhập không có trong Ad Hoc Provisioning Profile. Hãy đăng ký thiết bị trong Apple Developer, tạo lại profile và ký lại IPA.");
-    }
-
     // Consume quota only after all private chunks and the credential archive are validated.
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
@@ -593,20 +588,21 @@ app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
       installUrl = buildItmsServicesUrl(manifestUrl);
     }
 
+    const profileMessages = {
+      "ad-hoc": "Đã ký bằng Ad Hoc Profile. Chỉ thiết bị có UDID nằm trong danh sách ProvisionedDevices của profile mới cài/chạy được. Mở liên kết bằng Safari trên thiết bị đã đăng ký.",
+      enterprise: "Đã ký bằng In-House Profile. Chỉ sử dụng cho phân phối nội bộ tổ chức đủ điều kiện theo chương trình Apple Developer Enterprise.",
+      development: "Đã ký bằng Development Profile. Chỉ thiết bị được liệt kê trong profile mới cài/chạy được; dùng quy trình phát triển phù hợp. Worker không tạo liên kết OTA phân phối công khai cho loại profile này.",
+      "app-store": "Đã ký bằng App Store Distribution Profile. Profile này dùng cho quy trình App Store Connect; không thể cài trực tiếp qua liên kết OTA.",
+      other: "Profile CMS hợp lệ đã được chấp nhận để ZSign thử ký. Phương thức cài đặt phụ thuộc loại profile và chính sách Apple; Worker không tự tạo OTA cho profile chưa nhận diện.",
+    };
     const installation = {
       profileType: provisioningProfileInfo.type,
       registeredDeviceCount: provisioningProfileInfo.registeredDeviceCount,
       profileExpiresAt: provisioningProfileInfo.expiresAt,
       bundleIdentifier: appMetadata.bundleIdentifier,
       appVersion: appMetadata.bundleVersion,
-      requiresRegisteredDevice: provisioningProfileInfo.type === "ad-hoc",
-      message: provisioningProfileInfo.type === "ad-hoc"
-        ? "Ad Hoc: thiết bị cần cài phải có UDID nằm trong ProvisionedDevices của profile. Mở liên kết cài đặt bằng Safari trên iPhone/iPad. Nếu iOS từ chối cài qua website, dùng Apple Configurator hoặc Xcode trên thiết bị đã đăng ký."
-        : provisioningProfileInfo.type === "enterprise"
-          ? "Profile In-House: chỉ phân phối nội bộ tổ chức theo điều kiện Apple Developer Enterprise Program."
-          : provisioningProfileInfo.type === "development"
-            ? "Development Profile dùng cho phát triển; không được xác định là profile phân phối Ad Hoc."
-            : "App Store Profile không dùng để cài trực tiếp bằng liên kết Ad Hoc.",
+      requiresRegisteredDevice: provisioningProfileInfo.type === "ad-hoc" || provisioningProfileInfo.type === "development",
+      message: profileMessages[provisioningProfileInfo.type] || profileMessages.other,
     };
 
     auditCode = "OK";

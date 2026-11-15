@@ -94,11 +94,15 @@ Docker build sử dụng Debian Bookworm cho cả Builder và Runtime để trá
 - Chỉ dùng ứng dụng, P12 và provisioning profile mà người dùng có quyền sử dụng.
 
 
-## Ad Hoc OTA manifest update (2026-11-15)
+## Multi-profile signing and OTA manifest update (2026-11-16)
 
 The worker now requires the `openssl` CLI and the `plist` Node package to inspect the CMS-wrapped `.mobileprovision` and the IPA `Info.plist`. The Docker runtime installs OpenSSL. `GET /healthz` reports `openssl` and `provisioningProfileInspector`.
 
-For a valid Ad Hoc profile, `POST /v1/sign-blob` returns the private signed-IPA URL plus an expiring `manifestUrl` and `installUrl` (`itms-services`). The manifest is generated from the signed IPA's Bundle ID/version and includes only the signed IPA URL and standard app metadata. The user may submit an optional 40-hex-character `deviceUdid`; the Worker checks it against `ProvisionedDevices` and never logs or stores the UDID. If omitted, the UI warns that the target device must still be listed in the profile. Development/App Store profiles do not receive an Ad Hoc installation link.
+The signing endpoint accepts valid Apple iOS provisioning profiles across the common categories: Ad Hoc, In-House/Enterprise, Development, and App Store, plus structurally valid variants that ZSign may support. A profile must still pass CMS verification, required-field validation, expiry checks, App ID compatibility, and final ZSign certificate/profile compatibility.
+
+The Website does not ask for a manually entered UDID. Ad Hoc and Development profiles retain their original `ProvisionedDevices` list inside the signed app; iOS enforces that device allow-list when installing/running the app. Removing the text field does not register additional devices or make an unlisted device eligible. Enterprise and App Store profiles do not use that device list.
+
+Only Ad Hoc and eligible In-House/Enterprise profiles receive an `itms-services` manifest link. Development profiles use registered-device development workflows; App Store profiles are for App Store Connect and are not directly installable through an OTA manifest. Every successful signing result retains a private IPA download link as fallback.
 
 Signed IPA and manifest URLs expire after 60 minutes. The underlying private Blob objects expire after one day. The download link remains available as a fallback. OTA behavior should be verified on the intended iOS versions; Apple documents Ad Hoc installation for registered devices through Xcode Device Hub or Apple Configurator, and its wireless web-distribution guide describes In-House profiles.
 
@@ -110,3 +114,5 @@ The worker decodes `.mobileprovision` using OpenSSL `cms -verify -binary -inform
 If decoding fails, Runtime Logs include the OpenSSL strategy, exit code and a shortened diagnostic, without logging the profile content, UDIDs, P12, token or password. The API distinguishes CMS failure, malformed plist and incomplete profile. The profile itself remains private in the worker's temporary directory and is deleted after signing.
 
 Test locally with `npm test`; the CMS decoder tests generate a temporary synthetic profile signed by a disposable test certificate and never use production credentials.
+
+Expected Worker health build: `ipa-all-profiles-cms-compatible-no-udid-input-2026-11-16`.
