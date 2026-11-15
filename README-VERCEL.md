@@ -92,3 +92,12 @@ Docker build sử dụng Debian Bookworm cho cả Builder và Runtime để trá
 - Không ghi mật khẩu P12 vào Firestore audit log.
 - Xóa tệp tạm và các Blob đầu vào sau xử lý; TTL một ngày dọn các phiên bỏ dở.
 - Chỉ dùng ứng dụng, P12 và provisioning profile mà người dùng có quyền sử dụng.
+
+
+## Ad Hoc OTA manifest update (2026-11-15)
+
+The worker now requires the `openssl` CLI and the `plist` Node package to inspect the CMS-wrapped `.mobileprovision` and the IPA `Info.plist`. The Docker runtime installs OpenSSL. `GET /healthz` reports `openssl` and `provisioningProfileInspector`.
+
+For a valid Ad Hoc profile, `POST /v1/sign-blob` returns the private signed-IPA URL plus an expiring `manifestUrl` and `installUrl` (`itms-services`). The manifest is generated from the signed IPA's Bundle ID/version and includes only the signed IPA URL and standard app metadata. The user may submit an optional 40-hex-character `deviceUdid`; the Worker checks it against `ProvisionedDevices` and never logs or stores the UDID. If omitted, the UI warns that the target device must still be listed in the profile. Development/App Store profiles do not receive an Ad Hoc installation link.
+
+Signed IPA and manifest URLs expire after 60 minutes. The underlying private Blob objects expire after one day. The download link remains available as a fallback. OTA behavior should be verified on the intended iOS versions; Apple documents Ad Hoc installation for registered devices through Xcode Device Hub or Apple Configurator, and its wireless web-distribution guide describes In-House profiles.

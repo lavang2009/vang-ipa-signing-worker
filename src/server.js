@@ -13,8 +13,18 @@ import multer from "multer";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
+import { parse as parsePlist } from "plist";
 import { validateCertificateArchiveEntries } from "./archive-validation.js";
 import { applyCors, buildAllowedOrigins } from "./cors.js";
+import {
+  assertProvisioningProfileUsable,
+  buildItmsServicesUrl,
+  buildOtaManifestXml,
+  classifyProvisioningProfile,
+  isBundleIdentifierAllowed,
+  isDeviceRegistered,
+  normalizeDeviceUdid,
+} from "./ios-distribution.js";
 import { del, get, issueSignedToken, presignUrl, put } from "@vercel/blob";
 
 const execFileAsync = promisify(execFile);
@@ -26,7 +36,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-cert-archive-flex-2026-11-15";
+const workerBuild = "ipa-ad-hoc-ota-install-2026-11-15";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -70,6 +80,15 @@ try {
   zsignError = error?.code || "STARTUP_CHECK_FAILED";
   console.error("ZSign engine is unavailable:", zsignError, error instanceof Error ? error.message : "unknown");
 }
+let opensslReady = false;
+let opensslVersion = null;
+try {
+  const result = await execFileAsync("openssl", ["version"], { encoding: "utf8", timeout: 5_000 });
+  opensslVersion = String(result.stdout || "").trim().slice(0, 100);
+  opensslReady = Boolean(opensslVersion);
+} catch (error) {
+  console.error("OpenSSL profile decoder is unavailable:", error?.code || "STARTUP_CHECK_FAILED");
+}
 
 app.use((req, res, next) => {
   // A request ID lets the browser error be matched to one safe runtime-log entry.
@@ -96,7 +115,7 @@ app.get("/", (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.json({
     service: "VANG STORE IPA Signing Worker",
-    status: firebaseReady && zsignReady && blobReady ? "ready" : "not_ready",
+    status: firebaseReady && zsignReady && blobReady && opensslReady ? "ready" : "not_ready",
     health: "/healthz",
     signingEndpoint: "POST /v1/sign-blob",
     engine: zsignReady ? "zsign" : "unavailable",
@@ -104,7 +123,7 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/healthz", (_req, res) => {
-  const ready = firebaseReady && zsignReady && blobReady;
+  const ready = firebaseReady && zsignReady && blobReady && opensslReady;
   res.setHeader("Cache-Control", "no-store, max-age=0");
   res.status(ready ? 200 : 503).json({
     ok: ready,
@@ -115,6 +134,9 @@ app.get("/healthz", (_req, res) => {
     firebaseProjectId,
     zsign: zsignReady,
     blob: blobReady,
+    openssl: opensslReady,
+    opensslVersion,
+    provisioningProfileInspector: opensslReady,
     signBlob: true,
     corsConfigured: allowedOrigins.size > 0,
     allowedOriginCount: allowedOrigins.size,
@@ -211,6 +233,47 @@ async function extractZipEntry(zipPath, entryName, outputPath, maxBytes, label) 
   await fs.writeFile(outputPath, stdout, { flag: "wx", mode: 0o600 });
 }
 
+async function decodeProvisioningProfile(profilePath) {
+  try {
+    const result = await execFileAsync("openssl", [
+      "smime", "-inform", "DER", "-verify", "-noverify", "-in", profilePath,
+    ], { encoding: null, maxBuffer: 12 * 1024 * 1024, timeout: 30_000 });
+    const profile = parsePlist(new Uint8Array(result.stdout));
+    if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
+      throw new Error("Provisioning Profile không chứa plist dictionary hợp lệ.");
+    }
+    return profile;
+  } catch (error) {
+    const wrapped = new Error("Không giải mã được Provisioning Profile. Hãy kiểm tra file .mobileprovision có hợp lệ và không bị hỏng.");
+    wrapped.code = "INVALID_PROVISIONING_PROFILE";
+    wrapped.cause = error;
+    throw wrapped;
+  }
+}
+
+async function readIpaAppMetadata(ipaPath) {
+  const entries = await getZipEntries(ipaPath, 8 * 1024 * 1024);
+  const infoEntries = entries.filter((entry) => /^Payload\/[^/]+\.app\/Info\.plist$/i.test(entry.replace(/^\.\//, "")));
+  if (infoEntries.length !== 1) {
+    throw new Error("IPA phải có đúng một Payload/*.app/Info.plist để tạo liên kết cài đặt iOS.");
+  }
+
+  const result = await execFileAsync("unzip", ["-p", ipaPath, infoEntries[0]], {
+    encoding: null,
+    maxBuffer: 8 * 1024 * 1024,
+    timeout: 30_000,
+  });
+  const metadata = parsePlist(new Uint8Array(result.stdout));
+  const bundleIdentifier = String(metadata?.CFBundleIdentifier || "").trim();
+  const bundleVersion = String(metadata?.CFBundleVersion || metadata?.CFBundleShortVersionString || "").trim();
+  const title = String(metadata?.CFBundleDisplayName || metadata?.CFBundleName || "iOS App").trim();
+  if (!bundleIdentifier || !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleIdentifier)) {
+    throw new Error("Không đọc được Bundle ID hợp lệ từ Info.plist của IPA đã ký.");
+  }
+  if (!bundleVersion) throw new Error("Không đọc được phiên bản CFBundleVersion từ Info.plist của IPA.");
+  return { bundleIdentifier, bundleVersion, title };
+}
+
 async function ensureZipMagic(filePath, label) {
   const handle = await fs.open(filePath, "r");
   try {
@@ -290,7 +353,8 @@ function friendlySigningError(error) {
     if (/provision|profile|entitlement|bundle identifier|application-identifier/.test(lower)) return "Provisioning profile không tương thích với chứng chỉ, Bundle ID hoặc quyền của ứng dụng.";
     return "ZSign không thể ký IPA này. Hãy kiểm tra chứng chỉ còn hạn, profile phù hợp và thử lại bằng bộ tệp hợp lệ.";
   }
-  if (error?.code === "ENOENT") return "Signing worker thiếu chương trình unzip hoặc ZSign. Hãy liên hệ quản trị viên.";
+  if (error?.code === "INVALID_PROVISIONING_PROFILE") return raw;
+  if (error?.code === "ENOENT") return "Signing worker thiếu chương trình unzip, OpenSSL hoặc ZSign. Hãy liên hệ quản trị viên.";
   return raw || "Không thể xử lý tệp ký IPA.";
 }
 
@@ -430,6 +494,8 @@ app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
   let auditCode = "UNKNOWN";
   let ipaSize = 0;
   let certificateZipSize = 0;
+  let outputBlobPath = null;
+  let manifestBlobPath = null;
   const p12Password = String(body.p12Password || "");
   const bundleId = String(body.bundleId || "").trim();
   const appName = String(body.appName || "").trim();
@@ -459,6 +525,15 @@ app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
     await extractZipEntry(certificateZipPath, certEntries.p12Entry, p12Path, 10 * 1024 * 1024, "P12/PFX");
     await extractZipEntry(certificateZipPath, certEntries.profileEntry, profilePath, 10 * 1024 * 1024, "MobileProvision");
 
+    const rawProvisioningProfile = await decodeProvisioningProfile(profilePath);
+    const provisioningProfileInfo = assertProvisioningProfileUsable(
+      classifyProvisioningProfile(rawProvisioningProfile),
+    );
+    const requestedDeviceUdid = normalizeDeviceUdid(body.deviceUdid);
+    if (requestedDeviceUdid && provisioningProfileInfo.type === "ad-hoc" && !isDeviceRegistered(provisioningProfileInfo, requestedDeviceUdid)) {
+      throw new Error("UDID iPhone bạn nhập không có trong Ad Hoc Provisioning Profile. Hãy đăng ký thiết bị trong Apple Developer, tạo lại profile và ký lại IPA.");
+    }
+
     // Consume quota only after all private chunks and the credential archive are validated.
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
@@ -482,6 +557,11 @@ app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
     if (!outputStat.isFile() || outputStat.size < 4) throw new Error("ZSign không tạo được tệp IPA đầu ra.");
     await assertIpaStructure(outputPath);
 
+    const appMetadata = await readIpaAppMetadata(outputPath);
+    if (!isBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, appMetadata.bundleIdentifier)) {
+      throw new Error("Bundle ID trong IPA đã ký không khớp application-identifier của Provisioning Profile.");
+    }
+
     const sourceLabel = typeof body.originalName === "string" ? body.originalName : "vang-store";
     const outputName = safeInputName(path.basename(sourceLabel, path.extname(sourceLabel)) + "-signed", "vang-store-signed", ".ipa");
     const outputBlob = await put(`ipa-signing/${req.user.uid}/signed/${crypto.randomUUID()}-${outputName}`, createReadStream(outputPath), {
@@ -491,7 +571,8 @@ app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
       ttlDays: 1,
       multipart: outputStat.size > 10 * 1024 * 1024,
     });
-    const validUntil = Date.now() + 20 * 60 * 1000;
+    outputBlobPath = outputBlob.pathname;
+    const validUntil = Date.now() + 60 * 60 * 1000;
     const signedToken = await issueSignedToken({ pathname: outputBlob.pathname, operations: ["get"], validUntil });
     const { presignedUrl } = await presignUrl(signedToken, {
       operation: "get",
@@ -500,14 +581,69 @@ app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
       validUntil,
     });
 
+    let installUrl = null;
+    let manifestUrl = null;
+    if (provisioningProfileInfo.type === "ad-hoc" || provisioningProfileInfo.type === "enterprise") {
+      const manifestXml = buildOtaManifestXml({
+        ipaUrl: presignedUrl,
+        bundleIdentifier: appMetadata.bundleIdentifier,
+        bundleVersion: appMetadata.bundleVersion,
+        title: appName || appMetadata.title,
+      });
+      const manifestBlob = await put(
+        `ipa-signing/${req.user.uid}/manifests/${crypto.randomUUID()}.plist`,
+        manifestXml,
+        { access: "private", contentType: "application/xml; charset=utf-8", addRandomSuffix: true, ttlDays: 1 },
+      );
+      manifestBlobPath = manifestBlob.pathname;
+      const manifestToken = await issueSignedToken({ pathname: manifestBlob.pathname, operations: ["get"], validUntil });
+      const signedManifest = await presignUrl(manifestToken, {
+        operation: "get",
+        pathname: manifestBlob.pathname,
+        access: "private",
+        validUntil,
+      });
+      manifestUrl = signedManifest.presignedUrl;
+      installUrl = buildItmsServicesUrl(manifestUrl);
+    }
+
+    const installation = {
+      profileType: provisioningProfileInfo.type,
+      registeredDeviceCount: provisioningProfileInfo.registeredDeviceCount,
+      profileExpiresAt: provisioningProfileInfo.expiresAt,
+      bundleIdentifier: appMetadata.bundleIdentifier,
+      appVersion: appMetadata.bundleVersion,
+      requiresRegisteredDevice: provisioningProfileInfo.type === "ad-hoc",
+      message: provisioningProfileInfo.type === "ad-hoc"
+        ? "Ad Hoc: thiết bị cần cài phải có UDID nằm trong ProvisionedDevices của profile. Mở liên kết cài đặt bằng Safari trên iPhone/iPad. Nếu iOS từ chối cài qua website, dùng Apple Configurator hoặc Xcode trên thiết bị đã đăng ký."
+        : provisioningProfileInfo.type === "enterprise"
+          ? "Profile In-House: chỉ phân phối nội bộ tổ chức theo điều kiện Apple Developer Enterprise Program."
+          : provisioningProfileInfo.type === "development"
+            ? "Development Profile dùng cho phát triển; không được xác định là profile phân phối Ad Hoc."
+            : "App Store Profile không dùng để cài trực tiếp bằng liên kết Ad Hoc.",
+    };
+
     auditCode = "OK";
     await writeAudit(req.user.uid, "success", {
       ipaSize, certificateZipSize, bundleIdChanged: Boolean(bundleId),
       appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
+      profileType: provisioningProfileInfo.type,
+      registeredDeviceCount: provisioningProfileInfo.registeredDeviceCount,
     });
-    return res.json({ url: presignedUrl, name: outputName, expiresAt: new Date(validUntil).toISOString() });
+    return res.json({
+      url: presignedUrl,
+      name: outputName,
+      expiresAt: new Date(validUntil).toISOString(),
+      installUrl,
+      manifestUrl,
+      installation,
+    });
   } catch (error) {
     auditCode = error?.code || "VALIDATION_OR_SIGNING_ERROR";
+    const partialOutputs = [outputBlobPath, manifestBlobPath].filter(Boolean);
+    if (partialOutputs.length && blobReady) {
+      await del(partialOutputs).catch((cleanupError) => console.error("Could not delete partial signing outputs:", cleanupError instanceof Error ? cleanupError.message : "unknown"));
+    }
     const message = friendlySigningError(error);
     await writeAudit(req.user.uid, "failed", {
       ipaSize, certificateZipSize, bundleIdChanged: Boolean(bundleId),
@@ -572,7 +708,7 @@ app.use(async (error, req, res, _next) => {
 });
 
 const server = app.listen(port, "0.0.0.0", () => {
-  console.log(`VANG IPA signing worker listening on ${port}; Firebase ${firebaseReady ? "ready" : "not configured"}; ZSign ${zsignReady ? "ready" : "not ready"}; Blob ${blobReady ? "ready" : "not configured"}; CORS origins ${allowedOrigins.size}.`);
+  console.log(`VANG IPA signing worker listening on ${port}; Firebase ${firebaseReady ? "ready" : "not configured"}; ZSign ${zsignReady ? "ready" : "not ready"}; OpenSSL ${opensslReady ? "ready" : "not ready"}; Blob ${blobReady ? "ready" : "not configured"}; CORS origins ${allowedOrigins.size}.`);
 });
 server.requestTimeout = 270_000;
 server.headersTimeout = 60 * 1000;

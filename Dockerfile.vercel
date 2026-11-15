@@ -17,7 +17,7 @@ FROM node:22-bookworm-slim
 # its post-install script uses mktemp and fails when TMPDIR does not exist.
 ENV NODE_ENV=production PORT=8080 DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates unzip libssl3 libstdc++6 libgcc-s1 \
+    && apt-get install -y --no-install-recommends ca-certificates unzip openssl libssl3 libstdc++6 libgcc-s1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home appuser \
     && mkdir -p /tmp/vang-signing \
