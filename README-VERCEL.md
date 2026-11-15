@@ -49,7 +49,7 @@ Health check sẵn sàng chỉ khi có:
   "signBlob": true,
   "corsConfigured": true,
   "firebaseProjectId": "your-firebase-project-id",
-  "build": "ipa-sign-blob-500-diagnostics-2026-11-15",
+  "build": "ipa-cert-archive-flex-2026-11-15",
   "zsignVersion": "..."
 }
 ```
@@ -59,6 +59,8 @@ Health check sẵn sàng chỉ khi có:
 Website chia IPA thành phần 3 MiB, gửi từng phần tới API cùng domain `/api/ipa-signing/chunk`. Route website xác thực Firebase ID Token và gọi `put(..., { access: "private" })`. ZIP chứng chỉ được xử lý tương tự. Sau đó website gửi ID phiên tải qua JSON nhỏ đến `POST /v1/sign-blob`.
 
 Worker xác minh lại Firebase UID, dựng pathname từ UID và ID phiên (không tin pathname do client gửi), tải các phần riêng tư, ghép vào vùng tạm, xác thực cấu trúc IPA/ZIP, giải nén P12 và provisioning profile rồi chạy ZSign. Worker ghi IPA đầu ra vào Private Blob, trả presigned URL GET 20 phút và xóa các Blob đầu vào sau xử lý.
+
+**Định dạng ZIP chứng chỉ:** ZIP phải có đúng một file `.p12` hoặc `.pfx` và đúng một file `.mobileprovision`. Hai file có thể nằm trong thư mục bao ngoài hoặc nhiều cấp thư mục; ZIP cũng có thể chứa README/tệp hướng dẫn và metadata macOS/Windows. Worker chỉ trích xuất hai file chứng chỉ được nhận diện, bỏ qua tệp phụ, và từ chối ZIP thiếu hoặc có nhiều file chứng chỉ cùng loại. Không cần đổi tên thư mục thành `Certificates`/`ProvisioningProfiles`.
 
 Kết nối **một Private Blob Store duy nhất** vào cả hai Vercel Projects. Nếu website và Worker dùng hai store/token khác nhau, Worker không tìm thấy phần upload. Cấu hình `BLOB_READ_WRITE_TOKEN` trong cả hai project phải có mặt sau khi kết nối store.
 

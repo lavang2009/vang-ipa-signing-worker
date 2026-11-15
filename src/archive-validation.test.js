@@ -9,40 +9,87 @@ const validZip = [
   "ProvisioningProfiles/app.mobileprovision",
 ];
 
-test("accepts exactly two certificate folders and the required two files", () => {
+test("accepts the original two-folder archive", () => {
   assert.deepEqual(validateCertificateArchiveEntries(validZip), {
     p12Entry: "Certificates/distribution.p12",
     profileEntry: "ProvisioningProfiles/app.mobileprovision",
   });
 });
 
-test("accepts arbitrary folder names when the two required files are separated", () => {
-  assert.doesNotThrow(() => validateCertificateArchiveEntries([
-    "Folder A/cert.pfx", "Folder B/profile.mobileprovision",
-  ]));
+test("accepts a wrapper folder and nested certificate folders", () => {
+  assert.deepEqual(validateCertificateArchiveEntries([
+    "ExportedCertificates/",
+    "ExportedCertificates/AppleDistribution/",
+    "ExportedCertificates/AppleDistribution/distribution.p12",
+    "ExportedCertificates/Profiles/",
+    "ExportedCertificates/Profiles/app.mobileprovision",
+  ]), {
+    p12Entry: "ExportedCertificates/AppleDistribution/distribution.p12",
+    profileEntry: "ExportedCertificates/Profiles/app.mobileprovision",
+  });
 });
 
-test("rejects a missing folder or extra folder", () => {
-  assert.throws(() => validateCertificateArchiveEntries(["Certificates/cert.p12"]), /đúng hai thư mục/);
-  assert.throws(() => validateCertificateArchiveEntries([...validZip, "Extras/"]), /đúng hai thư mục/);
+test("accepts root README and other harmless files", () => {
+  assert.deepEqual(validateCertificateArchiveEntries([
+    "README.txt",
+    "certificate-info.pdf",
+    ...validZip,
+    "Notes/installation.txt",
+  ]), {
+    p12Entry: "Certificates/distribution.p12",
+    profileEntry: "ProvisioningProfiles/app.mobileprovision",
+  });
 });
 
-test("rejects extra files and duplicate credential files", () => {
-  assert.throws(() => validateCertificateArchiveEntries([...validZip, "Certificates/readme.txt"]), /chỉ được chứa hai tệp/);
-  assert.throws(() => validateCertificateArchiveEntries([...validZip, "Certificates/second.p12"]), /chỉ được chứa hai tệp/);
+test("accepts ZIPs prefixed with ./", () => {
+  assert.deepEqual(validateCertificateArchiveEntries([
+    "./",
+    "./Certificates/",
+    "./Certificates/distribution.p12",
+    "./Profiles/",
+    "./Profiles/app.mobileprovision",
+  ]), {
+    p12Entry: "./Certificates/distribution.p12",
+    profileEntry: "./Profiles/app.mobileprovision",
+  });
 });
 
-test("rejects nested folders and traversal paths", () => {
+test("ignores macOS and Windows archive metadata", () => {
+  assert.deepEqual(validateCertificateArchiveEntries([
+    ...validZip,
+    "__MACOSX/",
+    "__MACOSX/._distribution.p12",
+    "Certificates/.DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+  ]), {
+    p12Entry: "Certificates/distribution.p12",
+    profileEntry: "ProvisioningProfiles/app.mobileprovision",
+  });
+});
+
+test("rejects missing credential files with specific messages", () => {
+  assert.throws(() => validateCertificateArchiveEntries(["Certificates/readme.txt"]), /Không tìm thấy chứng chỉ/);
+  assert.throws(() => validateCertificateArchiveEntries(["Certificates/cert.p12"]), /Không tìm thấy provisioning profile/);
+});
+
+test("rejects duplicate P12 and provisioning profiles", () => {
   assert.throws(() => validateCertificateArchiveEntries([
-    "Certificates/", "Certificates/sub/", "Certificates/cert.p12", "Profiles/profile.mobileprovision",
-  ]), /không tạo thêm thư mục con/);
+    "A/one.p12", "B/two.pfx", "C/app.mobileprovision",
+  ]), /nhiều file \.p12/);
+  assert.throws(() => validateCertificateArchiveEntries([
+    "A/one.p12", "B/one.mobileprovision", "C/two.mobileprovision",
+  ]), /nhiều file \.mobileprovision/);
+});
+
+test("rejects unsafe or ambiguous paths", () => {
   assert.throws(() => validateCertificateArchiveEntries([
     "Certificates/../cert.p12", "Profiles/profile.mobileprovision",
   ]), /không an toàn/);
-});
-
-test("ignores common macOS archive metadata", () => {
-  assert.doesNotThrow(() => validateCertificateArchiveEntries([
-    ...validZip, "__MACOSX/", "__MACOSX/._distribution.p12", "Certificates/.DS_Store",
-  ]));
+  assert.throws(() => validateCertificateArchiveEntries([
+    "C:/Certificates/cert.p12", "Profiles/profile.mobileprovision",
+  ]), /không hợp lệ/);
+  assert.throws(() => validateCertificateArchiveEntries([
+    "Certificates\\cert.p12", "Profiles/profile.mobileprovision",
+  ]), /không hợp lệ/);
 });
