@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyCors, parseAllowedOrigins } from "./cors.js";
+import { applyCors, buildAllowedOrigins, parseAllowedOrigins } from "./cors.js";
 
 function responseStub(initialHeaders = {}) {
   const headers = new Map(Object.entries(initialHeaders));
@@ -51,4 +51,27 @@ test("allows server-to-server calls without Origin", () => {
   const res = responseStub();
   assert.equal(applyCors({ headers: {} }, res, new Set()), true);
   assert.equal(res.getHeader("Access-Control-Allow-Origin"), undefined);
+});
+
+
+test("always allows both exact VANG STORE production domains", () => {
+  const allowed = buildAllowedOrigins("");
+  assert.equal(allowed.has("https://luavang.store"), true);
+  assert.equal(allowed.has("https://www.luavang.store"), true);
+  assert.equal(allowed.has("https://evil.example"), false);
+});
+
+test("adds configured exact origins without allowing wildcard origins", () => {
+  const allowed = buildAllowedOrigins("https://preview.luavang.store,https://*.luavang.store");
+  assert.equal(allowed.has("https://preview.luavang.store"), true);
+  assert.equal(allowed.has("https://*.luavang.store"), false);
+});
+
+
+test("CORS middleware returns headers for the www production origin", () => {
+  const allowed = buildAllowedOrigins("");
+  const res = responseStub();
+  const accepted = applyCors({ headers: { origin: "https://www.luavang.store" } }, res, allowed);
+  assert.equal(accepted, true);
+  assert.equal(res.getHeader("Access-Control-Allow-Origin"), "https://www.luavang.store");
 });

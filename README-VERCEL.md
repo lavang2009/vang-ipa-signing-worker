@@ -15,7 +15,7 @@ Worker chạy ZSign thật, xác thực Firebase ID Token, ghi quota/audit vào 
 ```env
 FIREBASE_SERVICE_ACCOUNT={JSON_SERVICE_ACCOUNT_CUA_FIREBASE_VANG_STORE}
 BLOB_READ_WRITE_TOKEN={TOKEN_CUA_CUNG_PRIVATE_BLOB_STORE}
-ALLOWED_ORIGINS=https://luavang.store
+ALLOWED_ORIGINS=https://luavang.store,https://www.luavang.store
 SIGNING_DAILY_LIMIT=10
 SIGNING_MAX_IPA_BYTES=536870912
 SIGNING_MAX_CERT_ZIP_BYTES=20971520
@@ -24,7 +24,7 @@ SIGNING_TIMEOUT_MS=240000
 
 - `FIREBASE_SERVICE_ACCOUNT`: JSON service account của đúng Firebase project mà website sử dụng. Chỉ lưu trong Vercel Environment Variables; không commit JSON lên GitHub.
 - `BLOB_READ_WRITE_TOKEN`: token được tạo khi kết nối cùng Private Blob Store. Worker và website phải đọc/ghi cùng một store.
-- `ALLOWED_ORIGINS`: origin chính xác của website, phân cách bằng dấu phẩy, chấm phẩy hoặc xuống dòng. Với domain hiện tại dùng `https://luavang.store`; chỉ thêm `https://www.luavang.store` nếu domain www thực sự đang phục vụ website. Worker từ chối wildcard, path, query, fragment và credential; mỗi hostname cần được cho phép riêng.
+- `ALLOWED_ORIGINS`: các origin bổ sung/chính xác, phân cách bằng dấu phẩy, chấm phẩy hoặc xuống dòng. Worker luôn cho phép mặc định đúng hai domain Production `https://luavang.store` và `https://www.luavang.store`; biến này có thể liệt kê lại hai origin đó và thêm staging origin nếu cần. Worker từ chối wildcard, path, query, fragment và credential.
 - `SIGNING_DAILY_LIMIT`: giới hạn lượt ký mỗi người dùng mỗi ngày.
 - `SIGNING_TIMEOUT_MS`: timeout ZSign mặc định 240 giây.
 
@@ -35,7 +35,7 @@ SIGNING_TIMEOUT_MS=240000
 - `POST /v1/sign-blob`: nhận JSON metadata sau khi website upload các phần file vào Private Blob.
 - `POST /v1/sign`: endpoint multipart cũ để tương thích; không dùng endpoint này cho IPA lớn qua Vercel vì request body có giới hạn 4.5 MB.
 
-Health check sẵn sàng chỉ khi Firebase Admin, ZSign và `BLOB_READ_WRITE_TOKEN` đã được cấu hình. Trường `blob: true` xác nhận Worker có token; phải bảo đảm token này thuộc cùng Private Blob Store với Website. `corsConfigured: true` chỉ ra allow-list có ít nhất một origin; kiểm tra `/api/ipa-signing/health` trên Website để xác minh chính xác origin đang truy cập có được phép hay không.
+Health check sẵn sàng chỉ khi Firebase Admin, ZSign và `BLOB_READ_WRITE_TOKEN` đã được cấu hình. Trường `blob: true` xác nhận Worker có token; phải bảo đảm token này thuộc cùng Private Blob Store với Website. `corsConfigured: true` chỉ ra allow-list có ít nhất một origin; `firebaseProjectId` giúp so sánh Firebase project của Website và Worker; kiểm tra `/api/ipa-signing/health` trên Website để xác minh chính xác origin đang truy cập có được phép hay không.
 
 Health check sẵn sàng chỉ khi có:
 
@@ -48,7 +48,8 @@ Health check sẵn sàng chỉ khi có:
   "blob": true,
   "signBlob": true,
   "corsConfigured": true,
-  "build": "ipa-sign-blob-cors-diagnostics-2026-11-13",
+  "firebaseProjectId": "your-firebase-project-id",
+  "build": "ipa-sign-blob-cors-firebase-diagnostics-2026-11-15",
   "zsignVersion": "..."
 }
 ```
@@ -65,7 +66,7 @@ Việc chia phần tránh giới hạn request body 4.5 MB cho từng upload chu
 
 ## CORS
 
-Worker xử lý preflight `OPTIONS` và chỉ cho phép origin được chỉ định trong `ALLOWED_ORIGINS`. Website kiểm tra Worker qua API cùng domain `/api/ipa-signing/health`; API chuyển tiếp origin trình duyệt đến Worker để phát hiện CORS. Lệnh ký `POST /v1/sign-blob` vẫn gọi trực tiếp Worker, vì vậy phải cho phép chính xác origin đang mở website (không phải URL `/sign-ipa`). Sau khi sửa biến, redeploy Worker.
+Worker xử lý preflight `OPTIONS`, mặc định cho phép chính xác hai origin Production `https://luavang.store` và `https://www.luavang.store`, đồng thời cho phép thêm origin chính xác từ `ALLOWED_ORIGINS`. Website kiểm tra Worker qua API cùng domain `/api/ipa-signing/health`; API chuyển tiếp origin trình duyệt đến Worker để phát hiện CORS. Lệnh ký `POST /v1/sign-blob` vẫn gọi trực tiếp Worker, vì vậy phải cho phép chính xác origin đang mở website (không phải URL `/sign-ipa`). Sau khi sửa biến, redeploy Worker.
 
 ## Kiểm thử cục bộ
 

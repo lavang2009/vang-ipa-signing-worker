@@ -1,65 +1,46 @@
-VANG STORE – KHẮC PHỤC KẾT NỐI KÝ IPA
-Ngày cập nhật: 13/11/2026
+VANG STORE — IPA SIGNING WORKER DEPLOY NOTES (UPDATED 2026-11-15)
 
-1. NGUYÊN NHÂN ĐÃ XÁC ĐỊNH
-- Endpoint Worker Production hiện trả /healthz với ok=true, firebase=true, zsign=true nhưng thiếu trường blob.
-- Website chỉ bật nút ký khi Worker xác nhận blob=true và engine=zsign. Hai phía đang lệch phiên bản, và kết nối trực tiếp còn có thể bị CORS chặn.
-- Bản sửa thêm chẩn đoán /api/ipa-signing/health cùng domain để chỉ ra chính xác CORS, Worker cũ, Blob, Firebase hay ZSign.
+1. WORKER REPOSITORY
+- Repository: lavang2009/vang-ipa-signing-worker
+- Root Directory: ./ (Dockerfile.vercel, vercel.json, package.json and src/ at root).
+- Runtime uses Dockerfile.vercel and ZSign built on Debian Bookworm.
+- Signing endpoint for the current Website: POST /v1/sign-blob.
+- Legacy multipart POST /v1/sign remains for compatibility only; do not use it for large IPA uploads.
 
-2. CẬP NHẬT HAI REPOSITORY
-A. Website: vang-store-main-ipa-sign-fix-2026-11-13.zip
-- Giải nén ZIP.
-- Đưa TOÀN BỘ NỘI DUNG bên trong thư mục vang-store-main vào thư mục gốc repository GitHub lavang2009/vang-store (không tạo thêm thư mục vang-store-main lồng bên trong repo).
-- Commit và push nhánh main.
+2. CORS
+- The source now allows the exact production origins by default:
+  https://luavang.store
+  https://www.luavang.store
+- ALLOWED_ORIGINS may contain additional exact staging origins. Wildcards and paths are rejected.
+- After pushing source, create a new successful Production deployment.
 
-B. Worker: vang-ipa-signing-worker-ipa-sign-fix-2026-11-13.zip
-- Giải nén ZIP.
-- Đưa TOÀN BỘ NỘI DUNG bên trong thư mục vang-ipa-signing-worker-main vào thư mục gốc repository GitHub lavang2009/vang-ipa-signing-worker (không tạo thêm thư mục vang-ipa-signing-worker-main lồng bên trong repo).
-- Commit và push nhánh main.
+3. ENVIRONMENT VARIABLES
+- FIREBASE_SERVICE_ACCOUNT: service account JSON from the same Firebase project used by Website Firebase Client/Admin.
+- BLOB_READ_WRITE_TOKEN: token belonging to the exact same Private Vercel Blob Store connected to the Website.
+- ALLOWED_ORIGINS: optional explicit additional origins; recommended value:
+  https://luavang.store,https://www.luavang.store
+- Keep all secrets in Vercel Environment Variables; never commit them.
 
-3. CẤU HÌNH VERCEL – WORKER
-Trong Project vang-ipa-signing-worker → Settings → Environment Variables:
-ALLOWED_ORIGINS=https://luavang.store
-
-Chỉ thêm ,https://www.luavang.store nếu website thực sự được truy cập qua www.
-Không thêm /sign-ipa hoặc dấu / ở cuối.
-
-Giữ nguyên và kiểm tra các biến sau:
-FIREBASE_SERVICE_ACCOUNT = service account JSON đúng Firebase project của VANG STORE
-BLOB_READ_WRITE_TOKEN = token của Private Blob Store đang dùng chung với Website
-
-QUAN TRỌNG: Website và Worker phải kết nối CÙNG MỘT Private Blob Store. Không dùng hai store/token khác nhau.
-Sau khi push Worker, vào Vercel Project Worker và Deploy Production mới. Không chỉ redeploy website.
-
-4. CẤU HÌNH VERCEL – WEBSITE
-Trong Project vang-store → Settings → Environment Variables, kiểm tra:
-NEXT_PUBLIC_IPA_SIGNING_WORKER_URL=https://vang-ipa-signing-worker.vercel.app
-
-Giữ BLOB_READ_WRITE_TOKEN của cùng Private Blob Store và các biến Firebase Admin đang hoạt động.
-Sau khi push website, deploy Production mới.
-
-5. KIỂM TRA SAU KHI DEPLOY
-Mở:
-https://vang-ipa-signing-worker.vercel.app/healthz
-
-Worker mới cần trả về các trường:
+4. CHECK HEALTH
+Open https://vang-ipa-signing-worker.vercel.app/healthz. The current build must report:
 - ok: true
-- engine: "zsign"
+- engine: zsign
 - firebase: true
+- firebaseProjectId: the VANG STORE Firebase project ID
 - zsign: true
 - blob: true
 - signBlob: true
 - corsConfigured: true
-- build: "ipa-sign-blob-cors-diagnostics-2026-11-13"
+- build: ipa-sign-blob-cors-firebase-diagnostics-2026-11-15
 
-Sau đó mở https://luavang.store/sign-ipa và tải lại trang.
-Nếu CORS sai, website sẽ chỉ rõ origin đang truy cập và yêu cầu đặt ALLOWED_ORIGINS theo origin đó.
-Nếu Worker còn cũ, website sẽ báo thiếu blob/signBlob và yêu cầu triển khai lại Worker.
+5. WEBSITE DEPLOY
+Deploy the Website repository after setting:
+NEXT_PUBLIC_IPA_SIGNING_WORKER_URL=https://vang-ipa-signing-worker.vercel.app
 
-6. PHẠM VI KIỂM THỬ
-- Worker: node --check src/server.js đã qua.
-- Worker: npm test – 6/6 bài test đã qua.
-- Website: hai tệp TypeScript thay đổi đã qua kiểm tra cú pháp.
-- Chưa chạy full Next.js build do gói ZIP không kèm node_modules và môi trường kiểm tra không cài dependency của website.
+Then check /api/ipa-signing/health on both luavang.store and www.luavang.store. The route must return JSON (not a Next.js 404) and ok:true. It also compares Firebase Client, Website Admin and Worker project IDs.
 
-Không đưa FIREBASE_SERVICE_ACCOUNT, P12, mật khẩu P12 hoặc provisioning profile vào GitHub hay ZIP công khai.
+6. BLOB AND REAL SIGNING
+- Connect one Private Blob Store to both Vercel projects. Merely having BLOB_READ_WRITE_TOKEN in both projects does not prove they use the same store.
+- Browser Network must show chunk requests to /api/ipa-signing/chunk followed by one small JSON request to /v1/sign-blob.
+- The current Website must not send IPA multipart data to /v1/sign.
+- Health checks cannot prove a real signature; test with an IPA and credentials you are authorized to use.

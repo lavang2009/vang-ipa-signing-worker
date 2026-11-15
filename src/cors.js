@@ -50,3 +50,20 @@ export function applyCors(req, res, allowedOrigins) {
   res.setHeader("Access-Control-Max-Age", "86400");
   return true;
 }
+
+
+// The two production storefront origins are trusted explicitly so a missing or
+// incomplete Vercel ALLOWED_ORIGINS value cannot break the www/apex domain pair.
+// Additional exact origins (for approved preview/staging domains) may be supplied
+// through ALLOWED_ORIGINS. Wildcards and URL paths remain rejected by the parser.
+export const DEFAULT_PRODUCTION_ORIGINS = Object.freeze([
+  "https://luavang.store",
+  "https://www.luavang.store",
+]);
+
+export function buildAllowedOrigins(configuredValue) {
+  return new Set([
+    ...DEFAULT_PRODUCTION_ORIGINS,
+    ...parseAllowedOrigins(configuredValue),
+  ]);
+}

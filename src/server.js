@@ -14,7 +14,7 @@ import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { validateCertificateArchiveEntries } from "./archive-validation.js";
-import { applyCors, parseAllowedOrigins } from "./cors.js";
+import { applyCors, buildAllowedOrigins } from "./cors.js";
 import { del, get, issueSignedToken, presignUrl, put } from "@vercel/blob";
 
 const execFileAsync = promisify(execFile);
@@ -26,16 +26,19 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-sign-blob-cors-diagnostics-2026-11-13";
+const workerBuild = "ipa-sign-blob-cors-firebase-diagnostics-2026-11-15";
 
 // Keep the CORS allow-list strict and independently unit-tested.
-const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
+const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
 
 function initFirebase() {
   if (getApps().length) return getApps()[0];
   let account = null;
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     account = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    if (typeof account.private_key === "string") {
+      account.private_key = account.private_key.replace(/\\n/g, "\n");
+    }
   } else if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
     account = {
       project_id: process.env.FIREBASE_PROJECT_ID,
@@ -48,7 +51,12 @@ function initFirebase() {
 }
 
 let firebaseReady = false;
-try { initFirebase(); firebaseReady = true; }
+let firebaseProjectId = null;
+try {
+  const firebaseApp = initFirebase();
+  firebaseProjectId = firebaseApp.options.projectId || process.env.FIREBASE_PROJECT_ID || null;
+  firebaseReady = true;
+}
 catch (error) { console.error("Firebase Admin initialization failed:", error instanceof Error ? error.message : "unknown"); }
 let zsignReady = false;
 let zsignVersion = null;
@@ -96,6 +104,7 @@ app.get("/healthz", (_req, res) => {
     build: workerBuild,
     engine: zsignReady ? "zsign" : "unavailable",
     firebase: firebaseReady,
+    firebaseProjectId,
     zsign: zsignReady,
     blob: blobReady,
     signBlob: true,
@@ -491,7 +500,6 @@ app.use(async (error, req, res, _next) => {
 
 const server = app.listen(port, "0.0.0.0", () => {
   console.log(`VANG IPA signing worker listening on ${port}; Firebase ${firebaseReady ? "ready" : "not configured"}; ZSign ${zsignReady ? "ready" : "not ready"}; Blob ${blobReady ? "ready" : "not configured"}; CORS origins ${allowedOrigins.size}.`);
-  if (allowedOrigins.size === 0) console.error("ALLOWED_ORIGINS is empty. Browser signing requests will be rejected by CORS.");
 });
 server.requestTimeout = 270_000;
 server.headersTimeout = 60 * 1000;
