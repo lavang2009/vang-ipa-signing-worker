@@ -31,7 +31,7 @@ Open https://vang-ipa-signing-worker.vercel.app/healthz. The current build must 
 - blob: true
 - signBlob: true
 - corsConfigured: true
-- build: ipa-sign-blob-cors-firebase-diagnostics-2026-11-15
+- build: ipa-sign-blob-500-diagnostics-2026-11-15
 
 5. WEBSITE DEPLOY
 Deploy the Website repository after setting:

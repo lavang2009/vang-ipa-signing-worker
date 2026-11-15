@@ -49,7 +49,7 @@ Health check sẵn sàng chỉ khi có:
   "signBlob": true,
   "corsConfigured": true,
   "firebaseProjectId": "your-firebase-project-id",
-  "build": "ipa-sign-blob-cors-firebase-diagnostics-2026-11-15",
+  "build": "ipa-sign-blob-500-diagnostics-2026-11-15",
   "zsignVersion": "..."
 }
 ```
@@ -67,6 +67,10 @@ Việc chia phần tránh giới hạn request body 4.5 MB cho từng upload chu
 ## CORS
 
 Worker xử lý preflight `OPTIONS`, mặc định cho phép chính xác hai origin Production `https://luavang.store` và `https://www.luavang.store`, đồng thời cho phép thêm origin chính xác từ `ALLOWED_ORIGINS`. Website kiểm tra Worker qua API cùng domain `/api/ipa-signing/health`; API chuyển tiếp origin trình duyệt đến Worker để phát hiện CORS. Lệnh ký `POST /v1/sign-blob` vẫn gọi trực tiếp Worker, vì vậy phải cho phép chính xác origin đang mở website (không phải URL `/sign-ipa`). Sau khi sửa biến, redeploy Worker.
+
+## Chẩn đoán lỗi HTTP 500
+
+Mỗi request có `X-Request-ID`; lỗi JSON cũng trả `requestId` để đối chiếu với Runtime Logs. Worker thử `SIGNING_TMPDIR`, `os.tmpdir()` rồi `/tmp` khi tạo vùng tạm. Lỗi parser JSON, request metadata quá lớn và lỗi tạo thư mục tạm có mã HTTP riêng. Xem `WORKER-500-DIAGNOSTICS-2026-11-15.md` để tra log an toàn. Không chia sẻ token, service-account JSON, P12, provisioning profile hoặc mật khẩu.
 
 ## Kiểm thử cục bộ
 

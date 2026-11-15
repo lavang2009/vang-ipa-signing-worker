@@ -26,7 +26,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-sign-blob-cors-firebase-diagnostics-2026-11-15";
+const workerBuild = "ipa-sign-blob-500-diagnostics-2026-11-15";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -72,10 +72,18 @@ try {
 }
 
 app.use((req, res, next) => {
+  // A request ID lets the browser error be matched to one safe runtime-log entry.
+  // Never log request bodies, Authorization headers, or certificate passwords.
+  req.requestId = crypto.randomUUID();
+  res.setHeader("X-Request-ID", req.requestId);
+  next();
+});
+
+app.use((req, res, next) => {
   // Server-to-server requests without an Origin remain supported. Browser requests
   // must match the exact allow-list and receive the headers required for Bearer auth.
   if (!applyCors(req, res, allowedOrigins)) {
-    return res.status(403).json({ error: "Origin này không được phép sử dụng signing worker." });
+    return res.status(403).json({ error: "Origin này không được phép sử dụng signing worker.", requestId: req.requestId });
   }
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
@@ -129,12 +137,41 @@ async function authenticate(req, res, next) {
 }
 
 async function createWorkDir(req, _res, next) {
-  try {
-    req.workDir = await fs.mkdtemp(path.join(os.tmpdir(), "vang-sign-"));
-    next();
-  } catch {
-    next(new Error("Không thể tạo vùng làm việc tạm thời."));
+  // Some container revisions expose a custom TMPDIR that may not be writable.
+  // Try the configured directory first, then Node's default temp directory and
+  // finally /tmp. Every work directory is unique and private (mode 0700).
+  const candidates = [...new Set([
+    process.env.SIGNING_TMPDIR,
+    os.tmpdir(),
+    "/tmp",
+  ].filter((value) => typeof value === "string" && value.trim()))];
+
+  let lastError = null;
+  for (const baseDir of candidates) {
+    try {
+      await fs.mkdir(baseDir, { recursive: true, mode: 0o700 });
+      req.workDir = await fs.mkdtemp(path.join(baseDir, "vang-sign-"));
+      await fs.chmod(req.workDir, 0o700);
+      console.info("Signing work directory created:", JSON.stringify({
+        requestId: req.requestId || null,
+        tempBase: baseDir,
+      }));
+      return next();
+    } catch (error) {
+      lastError = error;
+      console.error("Signing temp directory unavailable:", JSON.stringify({
+        requestId: req.requestId || null,
+        tempBase: baseDir,
+        code: error?.code || null,
+        message: error instanceof Error ? error.message : "unknown",
+      }));
+    }
   }
+
+  const error = new Error("Không thể tạo vùng làm việc tạm thời trên signing worker.");
+  error.code = "WORKDIR_UNAVAILABLE";
+  error.cause = lastError || undefined;
+  return next(error);
 }
 
 const upload = multer({
@@ -490,12 +527,48 @@ app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
 
 app.use(async (error, req, res, _next) => {
   if (req.workDir) await fs.rm(req.workDir, { recursive: true, force: true }).catch(() => {});
+
+  const requestId = req.requestId || crypto.randomUUID();
+  const isBodyTooLarge = error?.type === "entity.too.large" || error?.status === 413 || error?.statusCode === 413;
+  const isInvalidJson = error instanceof SyntaxError && Object.prototype.hasOwnProperty.call(error, "body");
+
   if (error instanceof multer.MulterError) {
     const message = error.code === "LIMIT_FILE_SIZE" ? "Tệp tải lên vượt giới hạn dung lượng." : "Tệp tải lên không đúng định dạng hoặc vượt số lượng cho phép.";
-    return res.status(400).json({ error: message });
+    return res.status(400).json({ error: message, requestId });
   }
-  console.error("Signing worker request error:", error instanceof Error ? error.message : "unknown");
-  return res.status(500).json({ error: "Signing worker gặp lỗi nội bộ. Vui lòng thử lại sau." });
+
+  let status = 500;
+  let publicMessage = "Signing worker gặp lỗi nội bộ. Vui lòng thử lại sau.";
+  if (isBodyTooLarge) {
+    status = 413;
+    publicMessage = "Thông tin yêu cầu ký vượt giới hạn cho phép. Hãy tải lại trang và thử lại.";
+  } else if (isInvalidJson) {
+    status = 400;
+    publicMessage = "Dữ liệu yêu cầu ký không phải JSON hợp lệ.";
+  } else if (error?.code === "WORKDIR_UNAVAILABLE") {
+    status = 503;
+    publicMessage = "Worker chưa tạo được vùng xử lý tạm thời. Quản trị viên cần kiểm tra cấu hình thư mục tạm của Container.";
+  }
+
+  // Include request path and safe error metadata only. Do not log request bodies,
+  // Firebase tokens, Blob tokens, P12 passwords, or Authorization headers.
+  console.error("Signing worker request error:", JSON.stringify({
+    requestId,
+    method: req.method,
+    path: req.path,
+    status,
+    code: error?.code || error?.type || null,
+    message: error instanceof Error ? error.message : "unknown",
+    causeCode: error?.cause?.code || null,
+    causeMessage: error?.cause instanceof Error ? error.cause.message : null,
+  }));
+
+  res.setHeader("X-Request-ID", requestId);
+  return res.status(status).json({
+    error: `${publicMessage} Mã yêu cầu: ${requestId}.`,
+    requestId,
+    code: error?.code || error?.type || (status === 500 ? "INTERNAL_ERROR" : null),
+  });
 });
 
 const server = app.listen(port, "0.0.0.0", () => {
