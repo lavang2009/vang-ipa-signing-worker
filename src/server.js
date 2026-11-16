@@ -17,6 +17,7 @@ import { parse as parsePlist } from "plist";
 import { decodeProvisioningProfile } from "./provisioning-profile.js";
 import { validateCertificateArchiveEntries } from "./archive-validation.js";
 import { applyCors, buildAllowedOrigins } from "./cors.js";
+import { normalizeIpaSigningMaintenance } from "./maintenance.js";
 import {
   assertProvisioningProfileUsable,
   buildItmsServicesUrl,
@@ -35,7 +36,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-all-profiles-cms-compatible-no-udid-input-2026-11-16";
+const workerBuild = "ipa-signing-admin-maintenance-2026-11-16";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -137,6 +138,7 @@ app.get("/healthz", (_req, res) => {
     opensslVersion,
     provisioningProfileInspector: opensslReady,
     signBlob: true,
+    maintenanceControl: true,
     corsConfigured: allowedOrigins.size > 0,
     allowedOriginCount: allowedOrigins.size,
     signingEndpoint: "POST /v1/sign-blob",
@@ -154,6 +156,39 @@ async function authenticate(req, res, next) {
     next();
   } catch {
     res.status(401).json({ error: "Phiên đăng nhập không hợp lệ hoặc đã hết hạn. Hãy đăng nhập lại." });
+  }
+}
+
+async function enforceIpaSigningMaintenance(req, res, next) {
+  try {
+    const snapshot = await getFirestore().collection("siteSettings").doc("ipaSigningMaintenance").get();
+    const maintenance = normalizeIpaSigningMaintenance(snapshot.exists ? snapshot.data() || {} : {});
+    if (maintenance.enabled) {
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Retry-After", "60");
+      return res.status(503).json({
+        error: maintenance.message,
+        maintenance: true,
+        title: maintenance.title,
+        estimatedReturn: maintenance.estimatedReturn,
+        code: "IPA_SIGNING_MAINTENANCE",
+        requestId: req.requestId,
+      });
+    }
+    return next();
+  } catch (error) {
+    // Fail closed: signing must not continue if the maintenance state cannot be checked.
+    console.error("IPA signing maintenance state check failed:", JSON.stringify({
+      requestId: req.requestId || null,
+      code: error?.code || null,
+      message: error instanceof Error ? error.message : "unknown",
+    }));
+    return res.status(503).json({
+      error: "Không thể xác minh trạng thái dịch vụ ký IPA. Yêu cầu ký mới đang tạm khóa; vui lòng thử lại sau.",
+      maintenance: true,
+      code: "IPA_SIGNING_STATUS_UNAVAILABLE",
+      requestId: req.requestId,
+    });
   }
 }
 
@@ -344,7 +379,7 @@ function friendlySigningError(error) {
   return raw || "Không thể xử lý tệp ký IPA.";
 }
 
-app.post("/v1/sign", authenticate, createWorkDir, upload.fields([{ name: "ipa", maxCount: 1 }, { name: "certificateZip", maxCount: 1 }]), async (req, res, next) => {
+app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, upload.fields([{ name: "ipa", maxCount: 1 }, { name: "certificateZip", maxCount: 1 }]), async (req, res, next) => {
   const startedAt = Date.now();
   let auditStatus = "failed";
   let auditCode = "UNKNOWN";
@@ -472,7 +507,7 @@ async function downloadPrivateChunksToFile(pathnames, outputPath, maxBytes, labe
   return stat.size;
 }
 
-app.post("/v1/sign-blob", authenticate, createWorkDir, async (req, res) => {
+app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWorkDir, async (req, res) => {
   const startedAt = Date.now();
   const body = req.body && typeof req.body === "object" ? req.body : {};
   let ipaPaths = [];
