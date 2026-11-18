@@ -9,3 +9,7 @@ export function normalizeIpaSigningMaintenance(data = {}) {
     estimatedReturn: String(data?.estimatedReturn || "").trim().slice(0, 120),
   };
 }
+
+export function isIpaSigningMaintenanceBlocked(maintenance, isAdmin = false) {
+  return maintenance?.enabled === true && isAdmin !== true;
+}

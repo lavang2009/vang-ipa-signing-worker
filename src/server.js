@@ -15,9 +15,8 @@ import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { parse as parsePlist } from "plist";
 import { decodeProvisioningProfile } from "./provisioning-profile.js";
-import { validateCertificateArchiveEntries } from "./archive-validation.js";
 import { applyCors, buildAllowedOrigins } from "./cors.js";
-import { normalizeIpaSigningMaintenance } from "./maintenance.js";
+import { isIpaSigningMaintenanceBlocked, normalizeIpaSigningMaintenance } from "./maintenance.js";
 import {
   assertProvisioningProfileUsable,
   buildItmsServicesUrl,
@@ -31,12 +30,13 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const port = Number(process.env.PORT || 8080);
 const maxIpaBytes = Number(process.env.SIGNING_MAX_IPA_BYTES || 512 * 1024 * 1024);
-const maxCertZipBytes = Number(process.env.SIGNING_MAX_CERT_ZIP_BYTES || 20 * 1024 * 1024);
+const maxCredentialFileBytes = Number(process.env.SIGNING_MAX_CREDENTIAL_FILE_BYTES || process.env.SIGNING_MAX_CERT_ZIP_BYTES || 20 * 1024 * 1024);
+const maxProfileFileBytes = Number(process.env.SIGNING_MAX_PROFILE_FILE_BYTES || 10 * 1024 * 1024);
 const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-signing-admin-maintenance-2026-11-16";
+const workerBuild = "ipa-signing-separate-p12-profile-admin-maintenance-2026-11-18";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -146,6 +146,14 @@ app.get("/healthz", (_req, res) => {
   });
 });
 
+async function hasAdminAccess(user) {
+  if (user?.admin === true) return true;
+  const adminEmails = (process.env.ADMIN_EMAILS || "").split(",").map((email) => email.trim().toLowerCase()).filter(Boolean);
+  if (user?.email && adminEmails.includes(String(user.email).toLowerCase())) return true;
+  const snapshot = await getFirestore().collection("users").doc(user.uid).get();
+  return snapshot.exists && snapshot.get("role") === "admin";
+}
+
 async function authenticate(req, res, next) {
   try {
     if (!firebaseReady) return res.status(503).json({ error: "Signing worker chưa cấu hình Firebase Admin." });
@@ -153,6 +161,7 @@ async function authenticate(req, res, next) {
     const match = header.match(/^Bearer\s+(.+)$/i);
     if (!match) return res.status(401).json({ error: "Bạn cần đăng nhập để sử dụng công cụ ký IPA." });
     req.user = await getAuth().verifyIdToken(match[1], true);
+    try { req.isAdmin = await hasAdminAccess(req.user); } catch { req.isAdmin = false; }
     next();
   } catch {
     res.status(401).json({ error: "Phiên đăng nhập không hợp lệ hoặc đã hết hạn. Hãy đăng nhập lại." });
@@ -163,7 +172,7 @@ async function enforceIpaSigningMaintenance(req, res, next) {
   try {
     const snapshot = await getFirestore().collection("siteSettings").doc("ipaSigningMaintenance").get();
     const maintenance = normalizeIpaSigningMaintenance(snapshot.exists ? snapshot.data() || {} : {});
-    if (maintenance.enabled) {
+    if (isIpaSigningMaintenanceBlocked(maintenance, req.isAdmin === true)) {
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Retry-After", "60");
       return res.status(503).json({
@@ -235,7 +244,7 @@ const upload = multer({
     destination: (req, _file, callback) => callback(null, req.workDir),
     filename: (_req, file, callback) => callback(null, `${crypto.randomUUID()}${path.extname(file.originalname).toLowerCase()}`),
   }),
-  limits: { files: 2, fields: 6, fileSize: maxIpaBytes, fieldSize: 4096 },
+  limits: { files: 3, fields: 8, fileSize: maxIpaBytes, fieldSize: 4096 },
 });
 
 function safeInputName(value, fallback, extension) {
@@ -243,6 +252,7 @@ function safeInputName(value, fallback, extension) {
   return base.toLowerCase().endsWith(extension) ? base : `${base}${extension}`;
 }
 
+// ZIP inspection is retained only for the IPA app bundle itself. Signing credentials are uploaded as standalone P12/PFX and .mobileprovision files.
 async function getZipEntries(filePath, maxBuffer = 3 * 1024 * 1024) {
   let result;
   try {
@@ -253,18 +263,6 @@ async function getZipEntries(filePath, maxBuffer = 3 * 1024 * 1024) {
   const entries = result.stdout.split(/\r?\n/).filter(Boolean);
   if (!entries.length) throw new Error("ZIP không có dữ liệu hoặc không phải file ZIP hợp lệ.");
   return entries;
-}
-
-async function extractZipEntry(zipPath, entryName, outputPath, maxBytes, label) {
-  let stdout;
-  try {
-    const result = await execFileAsync("unzip", ["-p", zipPath, entryName], { encoding: "buffer", maxBuffer: maxBytes + 1, timeout: 30_000 });
-    stdout = result.stdout;
-  } catch {
-    throw new Error(`Không giải nén được ${label} từ ZIP hoặc tệp vượt giới hạn dung lượng.`);
-  }
-  if (!stdout || stdout.length === 0 || stdout.length > maxBytes) throw new Error(`${label} rỗng hoặc vượt giới hạn dung lượng.`);
-  await fs.writeFile(outputPath, stdout, { flag: "wx", mode: 0o600 });
 }
 
 async function readIpaAppMetadata(ipaPath) {
@@ -324,7 +322,9 @@ async function writeAudit(uid, status, details = {}) {
       uid,
       status,
       ipaSize: Number(details.ipaSize || 0),
-      certificateZipSize: Number(details.certificateZipSize || 0),
+      credentialFilesBytes: Number(details.p12Size || 0) + Number(details.profileSize || 0),
+      p12Size: Number(details.p12Size || 0),
+      profileSize: Number(details.profileSize || 0),
       bundleIdChanged: Boolean(details.bundleIdChanged),
       appNameChanged: Boolean(details.appNameChanged),
       durationMs: Number(details.durationMs || 0),
@@ -379,19 +379,21 @@ function friendlySigningError(error) {
   return raw || "Không thể xử lý tệp ký IPA.";
 }
 
-app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, upload.fields([{ name: "ipa", maxCount: 1 }, { name: "certificateZip", maxCount: 1 }]), async (req, res, next) => {
+app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, upload.fields([{ name: "ipa", maxCount: 1 }, { name: "p12", maxCount: 1 }, { name: "profile", maxCount: 1 }]), async (req, res, next) => {
   const startedAt = Date.now();
-  let auditStatus = "failed";
   let auditCode = "UNKNOWN";
   const files = req.files || {};
   const ipa = files.ipa?.[0];
-  const certificateZip = files.certificateZip?.[0];
+  const p12 = files.p12?.[0];
+  const profile = files.profile?.[0];
   try {
-    if (!ipa || !certificateZip) throw new Error("Vui lòng tải lên cả file IPA và ZIP chứng chỉ.");
+    if (!ipa || !p12 || !profile) throw new Error("Vui lòng tải lên IPA, chứng chỉ P12/PFX và Provisioning Profile.");
     if (!ipa.originalname.toLowerCase().endsWith(".ipa")) throw new Error("File ứng dụng phải có đuôi .ipa.");
-    if (!certificateZip.originalname.toLowerCase().endsWith(".zip")) throw new Error("Gói chứng chỉ phải là file .zip.");
+    if (!/\.(p12|pfx)$/i.test(p12.originalname)) throw new Error("Chứng chỉ phải là tệp .p12 hoặc .pfx.");
+    if (!profile.originalname.toLowerCase().endsWith(".mobileprovision")) throw new Error("Hồ sơ ký phải là tệp .mobileprovision.");
     if (ipa.size > maxIpaBytes) throw new Error(`IPA vượt giới hạn ${Math.floor(maxIpaBytes / 1024 / 1024)} MB.`);
-    if (certificateZip.size > maxCertZipBytes) throw new Error(`ZIP chứng chỉ vượt giới hạn ${Math.floor(maxCertZipBytes / 1024 / 1024)} MB.`);
+    if (p12.size > maxCredentialFileBytes) throw new Error(`P12/PFX vượt giới hạn ${Math.floor(maxCredentialFileBytes / 1024 / 1024)} MB.`);
+    if (profile.size > maxProfileFileBytes) throw new Error(`Provisioning Profile vượt giới hạn ${Math.floor(maxProfileFileBytes / 1024 / 1024)} MB.`);
     const p12Password = String(req.body.p12Password || "");
     const bundleId = String(req.body.bundleId || "").trim();
     const appName = String(req.body.appName || "").trim();
@@ -399,30 +401,21 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     if (appName.length > 100) throw new Error("Tên ứng dụng không được dài quá 100 ký tự.");
 
     await assertIpaStructure(ipa.path);
-    await ensureZipMagic(certificateZip.path, "ZIP chứng chỉ");
-    const zipEntries = await getZipEntries(certificateZip.path);
-    const certEntries = validateCertificateArchiveEntries(zipEntries);
-    const p12Path = path.join(req.workDir, "signing-cert.p12");
-    const profilePath = path.join(req.workDir, "signing-profile.mobileprovision");
-    await extractZipEntry(certificateZip.path, certEntries.p12Entry, p12Path, 10 * 1024 * 1024, "P12/PFX");
-    await extractZipEntry(certificateZip.path, certEntries.profileEntry, profilePath, 10 * 1024 * 1024, "MobileProvision");
-
-    // Charge quota only after both uploads and the certificate archive have passed validation.
+    const rawProvisioningProfile = await decodeProvisioningProfile(profile.path);
+    const provisioningProfileInfo = assertProvisioningProfileUsable(classifyProvisioningProfile(rawProvisioningProfile));
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
-    const args = ["-f", "-k", p12Path];
+    const args = ["-f", "-k", p12.path];
     if (p12Password) args.push("-p", p12Password);
-    args.push("-m", profilePath);
+    args.push("-m", profile.path);
     if (bundleId) args.push("-b", bundleId);
     if (appName) args.push("-n", appName);
     args.push("-o", outputPath, "-z", "6", ipa.path);
-
     try {
       await runZSign(args);
     } catch (error) {
       auditCode = error?.code || "SIGNING_FAILED";
       const raw = error instanceof Error ? error.message : "";
-      // Never forward or persist the P12 password, even if a native tool echoes arguments.
       if (p12Password && raw.includes(p12Password)) error.message = raw.split(p12Password).join("[REDACTED]");
       throw error;
     }
@@ -430,14 +423,12 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     const stat = await fs.stat(outputPath);
     if (!stat.isFile() || stat.size < 4) throw new Error("ZSign không tạo được tệp IPA đầu ra.");
     await assertIpaStructure(outputPath);
-    auditStatus = "success";
+    const outputName = safeInputName(path.basename(ipa.originalname, path.extname(ipa.originalname)) + "-signed", "vang-store-signed", ".ipa");
     auditCode = "OK";
-    await writeAudit(req.user.uid, auditStatus, {
-      ipaSize: ipa.size, certificateZipSize: certificateZip.size,
+    await writeAudit(req.user.uid, "success", {
+      ipaSize: ipa.size, p12Size: p12.size, profileSize: profile.size,
       bundleIdChanged: Boolean(bundleId), appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
     });
-
-    const outputName = safeInputName(path.basename(ipa.originalname, path.extname(ipa.originalname)) + "-signed", "vang-store-signed", ".ipa");
     res.setHeader("X-Signing-Engine", "ZSign");
     res.setHeader("Cache-Control", "no-store, private");
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -449,7 +440,7 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     const message = friendlySigningError(error);
     auditCode = error?.code || "VALIDATION_OR_SIGNING_ERROR";
     await writeAudit(req.user.uid, "failed", {
-      ipaSize: ipa?.size, certificateZipSize: certificateZip?.size,
+      ipaSize: ipa?.size, p12Size: p12?.size, profileSize: profile?.size,
       bundleIdChanged: Boolean(String(req.body.bundleId || "").trim()),
       appNameChanged: Boolean(String(req.body.appName || "").trim()),
       durationMs: Date.now() - startedAt, errorCode: auditCode,
@@ -458,7 +449,6 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     await fs.rm(req.workDir, { recursive: true, force: true }).catch(() => {});
   }
 });
-
 
 const uploadChunkBytes = 3 * 1024 * 1024;
 const uploadUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -511,10 +501,12 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
   const startedAt = Date.now();
   const body = req.body && typeof req.body === "object" ? req.body : {};
   let ipaPaths = [];
-  let certificatePaths = [];
+  let p12Paths = [];
+  let profilePaths = [];
   let auditCode = "UNKNOWN";
   let ipaSize = 0;
-  let certificateZipSize = 0;
+  let p12Size = 0;
+  let profileSize = 0;
   let outputBlobPath = null;
   let manifestBlobPath = null;
   const p12Password = String(body.p12Password || "");
@@ -524,33 +516,32 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
   try {
     if (!blobReady) throw new Error("Signing worker chưa cấu hình Vercel Blob. Hãy thêm BLOB_READ_WRITE_TOKEN và triển khai lại.");
     const ipaUpload = validateChunkUpload(body.ipaFileId, body.ipaTotalChunks, req.user.uid, "ipa", maxIpaBytes);
-    const certificateUpload = validateChunkUpload(body.certificateFileId, body.certificateTotalChunks, req.user.uid, "certificate", maxCertZipBytes);
+    const p12Upload = validateChunkUpload(body.p12FileId, body.p12TotalChunks, req.user.uid, "p12", maxCredentialFileBytes);
+    const profileUpload = validateChunkUpload(body.profileFileId, body.profileTotalChunks, req.user.uid, "profile", maxProfileFileBytes);
     ipaPaths = ipaUpload.paths;
-    certificatePaths = certificateUpload.paths;
+    p12Paths = p12Upload.paths;
+    profilePaths = profileUpload.paths;
+    if (!/\.(p12|pfx)$/i.test(String(body.p12FileName || ""))) throw new Error("Chứng chỉ phải là tệp .p12 hoặc .pfx.");
+    if (!/\.mobileprovision$/i.test(String(body.profileFileName || ""))) throw new Error("Hồ sơ ký phải là tệp .mobileprovision.");
     if (bundleId && (bundleId.length > 180 || !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId))) {
       throw new Error("Bundle ID không đúng định dạng.");
     }
     if (appName.length > 100) throw new Error("Tên ứng dụng không được dài quá 100 ký tự.");
 
     const ipaPath = path.join(req.workDir, "input.ipa");
-    const certificateZipPath = path.join(req.workDir, "certificate.zip");
-    ipaSize = await downloadPrivateChunksToFile(ipaPaths, ipaPath, maxIpaBytes, "IPA");
-    certificateZipSize = await downloadPrivateChunksToFile(certificatePaths, certificateZipPath, maxCertZipBytes, "ZIP chứng chỉ");
-
-    await assertIpaStructure(ipaPath);
-    await ensureZipMagic(certificateZipPath, "ZIP chứng chỉ");
-    const zipEntries = await getZipEntries(certificateZipPath);
-    const certEntries = validateCertificateArchiveEntries(zipEntries);
     const p12Path = path.join(req.workDir, "signing-cert.p12");
     const profilePath = path.join(req.workDir, "signing-profile.mobileprovision");
-    await extractZipEntry(certificateZipPath, certEntries.p12Entry, p12Path, 10 * 1024 * 1024, "P12/PFX");
-    await extractZipEntry(certificateZipPath, certEntries.profileEntry, profilePath, 10 * 1024 * 1024, "MobileProvision");
+    ipaSize = await downloadPrivateChunksToFile(ipaPaths, ipaPath, maxIpaBytes, "IPA");
+    p12Size = await downloadPrivateChunksToFile(p12Paths, p12Path, maxCredentialFileBytes, "P12/PFX");
+    profileSize = await downloadPrivateChunksToFile(profilePaths, profilePath, maxProfileFileBytes, "Provisioning Profile");
+
+    await assertIpaStructure(ipaPath);
 
     const rawProvisioningProfile = await decodeProvisioningProfile(profilePath);
     const provisioningProfileInfo = assertProvisioningProfileUsable(
       classifyProvisioningProfile(rawProvisioningProfile),
     );
-    // Consume quota only after all private chunks and the credential archive are validated.
+    // Consume quota only after the IPA, P12/PFX and provisioning profile have been validated.
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
     const args = ["-f", "-k", p12Path];
@@ -642,7 +633,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
 
     auditCode = "OK";
     await writeAudit(req.user.uid, "success", {
-      ipaSize, certificateZipSize, bundleIdChanged: Boolean(bundleId),
+      ipaSize, p12Size, profileSize, bundleIdChanged: Boolean(bundleId),
       appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
       profileType: provisioningProfileInfo.type,
       registeredDeviceCount: provisioningProfileInfo.registeredDeviceCount,
@@ -663,7 +654,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     }
     const message = friendlySigningError(error);
     await writeAudit(req.user.uid, "failed", {
-      ipaSize, certificateZipSize, bundleIdChanged: Boolean(bundleId),
+      ipaSize, p12Size, profileSize, bundleIdChanged: Boolean(bundleId),
       appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt, errorCode: auditCode,
     });
     const status = error?.code === "SIGNING_TIMEOUT" ? 504
@@ -672,7 +663,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       : 400;
     return res.status(status).json({ error: message });
   } finally {
-    const toDelete = [...ipaPaths, ...certificatePaths];
+    const toDelete = [...ipaPaths, ...p12Paths, ...profilePaths];
     if (toDelete.length && blobReady) await del(toDelete).catch((error) => console.error("Could not delete private input chunks:", error instanceof Error ? error.message : "unknown"));
     if (req.workDir) await fs.rm(req.workDir, { recursive: true, force: true }).catch(() => {});
   }

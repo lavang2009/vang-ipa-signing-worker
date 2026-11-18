@@ -18,7 +18,8 @@ BLOB_READ_WRITE_TOKEN={TOKEN_CUA_CUNG_PRIVATE_BLOB_STORE}
 ALLOWED_ORIGINS=https://luavang.store,https://www.luavang.store
 SIGNING_DAILY_LIMIT=10
 SIGNING_MAX_IPA_BYTES=536870912
-SIGNING_MAX_CERT_ZIP_BYTES=20971520
+SIGNING_MAX_CREDENTIAL_FILE_BYTES=20971520
+SIGNING_MAX_PROFILE_FILE_BYTES=10485760
 SIGNING_TIMEOUT_MS=240000
 ```
 
@@ -49,18 +50,18 @@ Health check sẵn sàng chỉ khi có:
   "signBlob": true,
   "corsConfigured": true,
   "firebaseProjectId": "your-firebase-project-id",
-  "build": "ipa-cert-archive-flex-2026-11-15",
+  "build": "ipa-signing-separate-p12-profile-admin-maintenance-2026-11-18",
   "zsignVersion": "..."
 }
 ```
 
 ## Luồng upload Blob riêng tư
 
-Website chia IPA thành phần 3 MiB, gửi từng phần tới API cùng domain `/api/ipa-signing/chunk`. Route website xác thực Firebase ID Token và gọi `put(..., { access: "private" })`. ZIP chứng chỉ được xử lý tương tự. Sau đó website gửi ID phiên tải qua JSON nhỏ đến `POST /v1/sign-blob`.
+Website chia IPA, P12/PFX và `.mobileprovision` thành các phần 3 MiB riêng biệt, gửi từng phần tới API cùng domain `/api/ipa-signing/chunk`. Route website xác thực Firebase ID Token và gọi `put(..., { access: "private" })`. Sau đó website gửi ba ID phiên tải qua JSON nhỏ đến `POST /v1/sign-blob`; mật khẩu P12 chỉ được gửi trong body của lần ký và không được ghi log.
 
-Worker xác minh lại Firebase UID, dựng pathname từ UID và ID phiên (không tin pathname do client gửi), tải các phần riêng tư, ghép vào vùng tạm, xác thực cấu trúc IPA/ZIP, giải nén P12 và provisioning profile rồi chạy ZSign. Worker ghi IPA đầu ra vào Private Blob, trả presigned URL GET 20 phút và xóa các Blob đầu vào sau xử lý.
+Worker xác minh lại Firebase UID, dựng pathname từ UID và ID phiên (không tin pathname do client gửi), tải các phần riêng tư, ghép IPA, P12/PFX và provisioning profile vào vùng tạm, xác thực IPA và CMS của profile rồi chạy ZSign trực tiếp với hai tệp chứng chỉ. Worker ghi IPA đầu ra vào Private Blob, trả presigned URL GET và xóa các Blob đầu vào sau xử lý.
 
-**Định dạng ZIP chứng chỉ:** ZIP phải có đúng một file `.p12` hoặc `.pfx` và đúng một file `.mobileprovision`. Hai file có thể nằm trong thư mục bao ngoài hoặc nhiều cấp thư mục; ZIP cũng có thể chứa README/tệp hướng dẫn và metadata macOS/Windows. Worker chỉ trích xuất hai file chứng chỉ được nhận diện, bỏ qua tệp phụ, và từ chối ZIP thiếu hoặc có nhiều file chứng chỉ cùng loại. Không cần đổi tên thư mục thành `Certificates`/`ProvisioningProfiles`.
+**Định dạng chứng chỉ:** Chọn trực tiếp hai tệp riêng biệt: một `.p12`/`.pfx` và một `.mobileprovision`. Không tạo ZIP chứng chỉ. Nếu P12/PFX có mật khẩu, nhập mật khẩu trong biểu mẫu; nếu không có mật khẩu thì để trống. Worker kiểm tra CMS của provisioning profile và chuyển trực tiếp các đường dẫn tệp cho ZSign.
 
 Kết nối **một Private Blob Store duy nhất** vào cả hai Vercel Projects. Nếu website và Worker dùng hai store/token khác nhau, Worker không tìm thấy phần upload. Cấu hình `BLOB_READ_WRITE_TOKEN` trong cả hai project phải có mặt sau khi kết nối store.
 
@@ -88,7 +89,7 @@ Docker build sử dụng Debian Bookworm cho cả Builder và Runtime để trá
 
 - Chỉ nhận Firebase ID Token hợp lệ; Worker xác minh lại token.
 - Chỉ đọc các Blob nằm dưới prefix UID của người gửi.
-- IPA, ZIP chứng chỉ và kết quả đều dùng Private Blob.
+- IPA, P12/PFX, Provisioning Profile và kết quả đều dùng Private Blob tạm thời.
 - Không ghi mật khẩu P12 vào Firestore audit log.
 - Xóa tệp tạm và các Blob đầu vào sau xử lý; TTL một ngày dọn các phiên bỏ dở.
 - Chỉ dùng ứng dụng, P12 và provisioning profile mà người dùng có quyền sử dụng.
@@ -115,4 +116,4 @@ If decoding fails, Runtime Logs include the OpenSSL strategy, exit code and a sh
 
 Test locally with `npm test`; the CMS decoder tests generate a temporary synthetic profile signed by a disposable test certificate and never use production credentials.
 
-Expected Worker health build: `ipa-all-profiles-cms-compatible-no-udid-input-2026-11-16`.
+Expected Worker health build: `ipa-signing-separate-p12-profile-admin-maintenance-2026-11-18`.
