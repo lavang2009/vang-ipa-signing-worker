@@ -1,0 +1,46 @@
+VANG STORE — IPA SIGNING WORKER DEPLOY NOTES (UPDATED 2026-11-15)
+
+1. WORKER REPOSITORY
+- Repository: lavang2009/vang-ipa-signing-worker
+- Root Directory: ./ (Dockerfile.vercel, vercel.json, package.json and src/ at root).
+- Runtime uses Dockerfile.vercel and ZSign built on Debian Bookworm.
+- Signing endpoint for the current Website: POST /v1/sign-blob.
+- Legacy multipart POST /v1/sign remains for compatibility only; do not use it for large IPA uploads.
+
+2. CORS
+- The source now allows the exact production origins by default:
+  https://luavang.store
+  https://www.luavang.store
+- ALLOWED_ORIGINS may contain additional exact staging origins. Wildcards and paths are rejected.
+- After pushing source, create a new successful Production deployment.
+
+3. ENVIRONMENT VARIABLES
+- FIREBASE_SERVICE_ACCOUNT: service account JSON from the same Firebase project used by Website Firebase Client/Admin.
+- BLOB_READ_WRITE_TOKEN: token belonging to the exact same Private Vercel Blob Store connected to the Website.
+- ALLOWED_ORIGINS: optional explicit additional origins; recommended value:
+  https://luavang.store,https://www.luavang.store
+- Keep all secrets in Vercel Environment Variables; never commit them.
+
+4. CHECK HEALTH
+Open https://vang-ipa-signing-worker.vercel.app/healthz. The current build must report:
+- ok: true
+- engine: zsign
+- firebase: true
+- firebaseProjectId: the VANG STORE Firebase project ID
+- zsign: true
+- blob: true
+- signBlob: true
+- corsConfigured: true
+- build: ipa-sign-blob-500-diagnostics-2026-11-15
+
+5. WEBSITE DEPLOY
+Deploy the Website repository after setting:
+NEXT_PUBLIC_IPA_SIGNING_WORKER_URL=https://vang-ipa-signing-worker.vercel.app
+
+Then check /api/ipa-signing/health on both luavang.store and www.luavang.store. The route must return JSON (not a Next.js 404) and ok:true. It also compares Firebase Client, Website Admin and Worker project IDs.
+
+6. BLOB AND REAL SIGNING
+- Connect one Private Blob Store to both Vercel projects. Merely having BLOB_READ_WRITE_TOKEN in both projects does not prove they use the same store.
+- Browser Network must show chunk requests to /api/ipa-signing/chunk followed by one small JSON request to /v1/sign-blob.
+- The current Website must not send IPA multipart data to /v1/sign.
+- Health checks cannot prove a real signature; test with an IPA and credentials you are authorized to use.
