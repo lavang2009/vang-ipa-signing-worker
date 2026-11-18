@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   assertProvisioningProfileUsable,
+  assertTargetDeviceAllowed,
   buildItmsServicesUrl,
   buildOtaManifestXml,
   classifyProvisioningProfile,
@@ -51,7 +52,7 @@ test("matches exact and wildcard App IDs", () => {
 
 
 
-test("keeps Ad Hoc and Development device restrictions in the profile without asking for a client UDID", () => {
+test("keeps Ad Hoc and Development device restrictions when no target UDID is supplied", () => {
   const adHoc = classifyProvisioningProfile(adhocProfile());
   const development = classifyProvisioningProfile(adhocProfile({ Entitlements: {
     "get-task-allow": true,
@@ -61,8 +62,8 @@ test("keeps Ad Hoc and Development device restrictions in the profile without as
   assert.equal(adHoc.registeredDeviceCount, 2);
   assert.equal(development.type, "development");
   assert.equal(development.registeredDeviceCount, 2);
-  // No target UDID is collected or checked by the website/worker. iOS enforces
-  // the device list embedded in the signed provisioning profile at install time.
+  // Without a target UDID, the signed profile remains authoritative and iOS
+  // enforces its registered-device list at installation time.
 });
 
 test("classifies every standard iOS profile type for signing", () => {
@@ -100,4 +101,26 @@ test("builds an itms-services URL only from HTTPS manifest URLs", () => {
   assert.match(link, /^itms-services:\/\//);
   assert.match(link, /download-manifest/);
   assert.throws(() => buildItmsServicesUrl("http://example.com/manifest.plist"), /HTTPS/);
+});
+
+
+test("accepts a target UDID that is listed in Ad Hoc or Development profile", () => {
+  const info = classifyProvisioningProfile(adhocProfile());
+  assert.deepEqual(assertTargetDeviceAllowed(info, udidA.toLowerCase()), { provided: true, registered: true });
+});
+
+test("rejects a target UDID that is not registered in Ad Hoc profile", () => {
+  const info = classifyProvisioningProfile(adhocProfile());
+  assert.throws(() => assertTargetDeviceAllowed(info, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"), (error) => error.code === "TARGET_DEVICE_NOT_REGISTERED");
+});
+
+test("keeps target UDID optional and validates its format", () => {
+  const info = classifyProvisioningProfile(adhocProfile());
+  assert.deepEqual(assertTargetDeviceAllowed(info, ""), { provided: false, registered: null });
+  assert.throws(() => assertTargetDeviceAllowed(info, "not-a-udid"), (error) => error.code === "INVALID_TARGET_UDID");
+});
+
+test("does not require UDID for unrestricted enterprise profile", () => {
+  const info = classifyProvisioningProfile({ ProvisionsAllDevices: true, ExpirationDate: future, Entitlements: { "application-identifier": "ABCDE12345.com.example.app" } });
+  assert.deepEqual(assertTargetDeviceAllowed(info, udidA), { provided: true, registered: null });
 });

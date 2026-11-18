@@ -51,6 +51,29 @@ export function assertProvisioningProfileUsable(profileInfo, now = Date.now()) {
   return profileInfo;
 }
 
+
+/** Validate an optional target device against the registered device list in a signed profile. */
+export function assertTargetDeviceAllowed(profileInfo, targetUdid) {
+  const normalized = typeof targetUdid === "string" ? targetUdid.trim().toUpperCase() : "";
+  if (!normalized) return { provided: false, registered: null };
+  if (!/^[A-F0-9]{40}$/.test(normalized)) {
+    const error = new Error("UDID phải gồm đúng 40 ký tự hexadecimal (0-9, A-F). ");
+    error.code = "INVALID_TARGET_UDID";
+    throw error;
+  }
+  if (profileInfo?.type === "ad-hoc" || profileInfo?.type === "development") {
+    const devices = Array.isArray(profileInfo.provisionedDevices) ? profileInfo.provisionedDevices : [];
+    const registered = devices.some((device) => typeof device === "string" && device.trim().toUpperCase() === normalized);
+    if (!registered) {
+      const error = new Error("UDID bạn nhập chưa nằm trong danh sách thiết bị của Provisioning Profile. Hãy đăng ký thiết bị trong Apple Developer, tạo và tải lại profile rồi ký lại.");
+      error.code = "TARGET_DEVICE_NOT_REGISTERED";
+      throw error;
+    }
+    return { provided: true, registered: true };
+  }
+  return { provided: true, registered: null };
+}
+
 export function isBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier) {
   if (typeof applicationIdentifier !== "string" || !applicationIdentifier.trim()) return false;
   if (typeof bundleIdentifier !== "string" || !bundleIdentifier.trim()) return false;

@@ -19,6 +19,7 @@ import { applyCors, buildAllowedOrigins } from "./cors.js";
 import { isIpaSigningMaintenanceBlocked, normalizeIpaSigningMaintenance } from "./maintenance.js";
 import {
   assertProvisioningProfileUsable,
+  assertTargetDeviceAllowed,
   buildItmsServicesUrl,
   buildOtaManifestXml,
   classifyProvisioningProfile,
@@ -397,12 +398,19 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     const p12Password = String(req.body.p12Password || "");
     const bundleId = String(req.body.bundleId || "").trim();
     const appName = String(req.body.appName || "").trim();
+    const targetUdid = String(req.body.targetUdid || "").trim().toUpperCase();
     if (bundleId && (bundleId.length > 180 || !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId))) throw new Error("Bundle ID không đúng định dạng.");
     if (appName.length > 100) throw new Error("Tên ứng dụng không được dài quá 100 ký tự.");
+    if (targetUdid && !/^[A-F0-9]{40}$/.test(targetUdid)) {
+      const error = new Error("UDID phải gồm đúng 40 ký tự hexadecimal (0-9, A-F).");
+      error.code = "INVALID_TARGET_UDID";
+      throw error;
+    }
 
     await assertIpaStructure(ipa.path);
     const rawProvisioningProfile = await decodeProvisioningProfile(profile.path);
     const provisioningProfileInfo = assertProvisioningProfileUsable(classifyProvisioningProfile(rawProvisioningProfile));
+    const targetDeviceCheck = assertTargetDeviceAllowed(provisioningProfileInfo, targetUdid);
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
     const args = ["-f", "-k", p12.path];
@@ -512,6 +520,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
   const p12Password = String(body.p12Password || "");
   const bundleId = String(body.bundleId || "").trim();
   const appName = String(body.appName || "").trim();
+  const targetUdid = String(body.targetUdid || "").trim().toUpperCase();
 
   try {
     if (!blobReady) throw new Error("Signing worker chưa cấu hình Vercel Blob. Hãy thêm BLOB_READ_WRITE_TOKEN và triển khai lại.");
@@ -527,6 +536,11 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       throw new Error("Bundle ID không đúng định dạng.");
     }
     if (appName.length > 100) throw new Error("Tên ứng dụng không được dài quá 100 ký tự.");
+    if (targetUdid && !/^[A-F0-9]{40}$/.test(targetUdid)) {
+      const error = new Error("UDID phải gồm đúng 40 ký tự hexadecimal (0-9, A-F).");
+      error.code = "INVALID_TARGET_UDID";
+      throw error;
+    }
 
     const ipaPath = path.join(req.workDir, "input.ipa");
     const p12Path = path.join(req.workDir, "signing-cert.p12");
@@ -541,7 +555,8 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     const provisioningProfileInfo = assertProvisioningProfileUsable(
       classifyProvisioningProfile(rawProvisioningProfile),
     );
-    // Consume quota only after the IPA, P12/PFX and provisioning profile have been validated.
+    const targetDeviceCheck = assertTargetDeviceAllowed(provisioningProfileInfo, targetUdid);
+    // Consume quota only after the IPA, P12/PFX, provisioning profile and optional device check pass.
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
     const args = ["-f", "-k", p12Path];
@@ -628,7 +643,9 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       bundleIdentifier: appMetadata.bundleIdentifier,
       appVersion: appMetadata.bundleVersion,
       requiresRegisteredDevice: provisioningProfileInfo.type === "ad-hoc" || provisioningProfileInfo.type === "development",
-      message: profileMessages[provisioningProfileInfo.type] || profileMessages.other,
+      targetDeviceProvided: targetDeviceCheck.provided,
+      targetDeviceRegistered: targetDeviceCheck.registered,
+      message: (profileMessages[provisioningProfileInfo.type] || profileMessages.other) + (targetDeviceCheck.registered === true ? " UDID vừa kiểm tra đã có trong danh sách thiết bị của profile." : ""),
     };
 
     auditCode = "OK";
@@ -661,11 +678,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       : message.startsWith("Bạn đã đạt giới hạn") ? 429
       : error?.code === "BLOB_NOT_FOUND" ? 404
       : 400;
-    return res.status(status).json({
-      error: message,
-      code: auditCode,
-      requestId: req.requestId || null,
-    });
+    return res.status(status).json({ error: message });
   } finally {
     const toDelete = [...ipaPaths, ...p12Paths, ...profilePaths];
     if (toDelete.length && blobReady) await del(toDelete).catch((error) => console.error("Could not delete private input chunks:", error instanceof Error ? error.message : "unknown"));
