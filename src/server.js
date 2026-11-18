@@ -661,7 +661,11 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       : message.startsWith("Bạn đã đạt giới hạn") ? 429
       : error?.code === "BLOB_NOT_FOUND" ? 404
       : 400;
-    return res.status(status).json({ error: message });
+    return res.status(status).json({
+      error: message,
+      code: auditCode,
+      requestId: req.requestId || null,
+    });
   } finally {
     const toDelete = [...ipaPaths, ...p12Paths, ...profilePaths];
     if (toDelete.length && blobReady) await del(toDelete).catch((error) => console.error("Could not delete private input chunks:", error instanceof Error ? error.message : "unknown"));
