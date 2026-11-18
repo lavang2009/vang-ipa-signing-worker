@@ -52,18 +52,35 @@ export function assertProvisioningProfileUsable(profileInfo, now = Date.now()) {
 }
 
 
+/** Normalize an Apple UDID without accepting arbitrary lengths or characters. */
+export function normalizeAppleUdid(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toUpperCase();
+  const legacy = /^[A-F0-9]{40}$/.test(normalized);
+  const chipEcid = /^[A-F0-9]{8}-[A-F0-9]{16}$/.test(normalized);
+  return legacy || chipEcid ? normalized : null;
+}
+
+/** Compare equivalent Apple UDID representations case-insensitively. */
+function canonicalAppleUdid(value) {
+  const normalized = normalizeAppleUdid(value);
+  return normalized ? normalized.replace(/-/g, "") : null;
+}
+
 /** Validate an optional target device against the registered device list in a signed profile. */
 export function assertTargetDeviceAllowed(profileInfo, targetUdid) {
-  const normalized = typeof targetUdid === "string" ? targetUdid.trim().toUpperCase() : "";
-  if (!normalized) return { provided: false, registered: null };
-  if (!/^[A-F0-9]{40}$/.test(normalized)) {
-    const error = new Error("UDID phải gồm đúng 40 ký tự hexadecimal (0-9, A-F). ");
+  const raw = typeof targetUdid === "string" ? targetUdid.trim() : "";
+  if (!raw) return { provided: false, registered: null };
+  const normalized = normalizeAppleUdid(raw);
+  if (!normalized) {
+    const error = new Error("UDID không đúng định dạng. Hỗ trợ 40 ký tự hex hoặc dạng 25 ký tự (8 hex-16 hex).");
     error.code = "INVALID_TARGET_UDID";
     throw error;
   }
   if (profileInfo?.type === "ad-hoc" || profileInfo?.type === "development") {
     const devices = Array.isArray(profileInfo.provisionedDevices) ? profileInfo.provisionedDevices : [];
-    const registered = devices.some((device) => typeof device === "string" && device.trim().toUpperCase() === normalized);
+    const targetCanonical = canonicalAppleUdid(normalized);
+    const registered = devices.some((device) => canonicalAppleUdid(device) === targetCanonical);
     if (!registered) {
       const error = new Error("UDID bạn nhập chưa nằm trong danh sách thiết bị của Provisioning Profile. Hãy đăng ký thiết bị trong Apple Developer, tạo và tải lại profile rồi ký lại.");
       error.code = "TARGET_DEVICE_NOT_REGISTERED";

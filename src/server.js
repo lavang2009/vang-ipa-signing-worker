@@ -24,6 +24,7 @@ import {
   buildOtaManifestXml,
   classifyProvisioningProfile,
   isBundleIdentifierAllowed,
+  normalizeAppleUdid,
 } from "./ios-distribution.js";
 import { del, get, issueSignedToken, presignUrl, put } from "@vercel/blob";
 
@@ -37,7 +38,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-signing-separate-p12-profile-admin-maintenance-2026-11-18";
+const workerBuild = "ipa-signing-apple-udid-25-and-40-char-support-2026-11-18";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -398,11 +399,12 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     const p12Password = String(req.body.p12Password || "");
     const bundleId = String(req.body.bundleId || "").trim();
     const appName = String(req.body.appName || "").trim();
-    const targetUdid = String(req.body.targetUdid || "").trim().toUpperCase();
+    const rawTargetUdid = String(req.body.targetUdid || "").trim();
+    const targetUdid = rawTargetUdid ? normalizeAppleUdid(rawTargetUdid) || rawTargetUdid.toUpperCase() : "";
     if (bundleId && (bundleId.length > 180 || !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(bundleId))) throw new Error("Bundle ID không đúng định dạng.");
     if (appName.length > 100) throw new Error("Tên ứng dụng không được dài quá 100 ký tự.");
-    if (targetUdid && !/^[A-F0-9]{40}$/.test(targetUdid)) {
-      const error = new Error("UDID phải gồm đúng 40 ký tự hexadecimal (0-9, A-F).");
+    if (rawTargetUdid && !normalizeAppleUdid(rawTargetUdid)) {
+      const error = new Error("UDID không đúng định dạng. Hỗ trợ 40 ký tự hex hoặc dạng 25 ký tự (8 hex-16 hex).");
       error.code = "INVALID_TARGET_UDID";
       throw error;
     }
@@ -520,7 +522,8 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
   const p12Password = String(body.p12Password || "");
   const bundleId = String(body.bundleId || "").trim();
   const appName = String(body.appName || "").trim();
-  const targetUdid = String(body.targetUdid || "").trim().toUpperCase();
+  const rawTargetUdid = String(body.targetUdid || "").trim();
+  const targetUdid = rawTargetUdid ? normalizeAppleUdid(rawTargetUdid) || rawTargetUdid.toUpperCase() : "";
 
   try {
     if (!blobReady) throw new Error("Signing worker chưa cấu hình Vercel Blob. Hãy thêm BLOB_READ_WRITE_TOKEN và triển khai lại.");
@@ -536,8 +539,8 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       throw new Error("Bundle ID không đúng định dạng.");
     }
     if (appName.length > 100) throw new Error("Tên ứng dụng không được dài quá 100 ký tự.");
-    if (targetUdid && !/^[A-F0-9]{40}$/.test(targetUdid)) {
-      const error = new Error("UDID phải gồm đúng 40 ký tự hexadecimal (0-9, A-F).");
+    if (rawTargetUdid && !normalizeAppleUdid(rawTargetUdid)) {
+      const error = new Error("UDID không đúng định dạng. Hỗ trợ 40 ký tự hex hoặc dạng 25 ký tự (8 hex-16 hex).");
       error.code = "INVALID_TARGET_UDID";
       throw error;
     }

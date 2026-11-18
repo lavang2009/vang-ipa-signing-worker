@@ -12,6 +12,7 @@ import {
 const future = new Date(Date.now() + 86_400_000);
 const udidA = "0123456789ABCDEF0123456789ABCDEF01234567";
 const udidB = "89ABCDEF0123456789ABCDEF0123456789ABCDEF";
+const udid25 = "00008110-0012345678901234";
 
 function adhocProfile(overrides = {}) {
   return {
@@ -123,4 +124,22 @@ test("keeps target UDID optional and validates its format", () => {
 test("does not require UDID for unrestricted enterprise profile", () => {
   const info = classifyProvisioningProfile({ ProvisionsAllDevices: true, ExpirationDate: future, Entitlements: { "application-identifier": "ABCDE12345.com.example.app" } });
   assert.deepEqual(assertTargetDeviceAllowed(info, udidA), { provided: true, registered: null });
+});
+
+
+test("accepts and matches the newer 25-character chip-id/ECID UDID form", () => {
+  const info = classifyProvisioningProfile(adhocProfile({ ProvisionedDevices: [udid25] }));
+  assert.deepEqual(assertTargetDeviceAllowed(info, udid25.toLowerCase()), { provided: true, registered: true });
+});
+
+test("matches 25-character UDIDs when hexadecimal letter casing differs", () => {
+  const profileUdid = "00008110-00ABCDEF12345678";
+  const info = classifyProvisioningProfile(adhocProfile({ ProvisionedDevices: [profileUdid.toLowerCase()] }));
+  assert.deepEqual(assertTargetDeviceAllowed(info, profileUdid), { provided: true, registered: true });
+});
+
+test("rejects malformed 25-character UDID variants", () => {
+  const info = classifyProvisioningProfile(adhocProfile({ ProvisionedDevices: [udid25] }));
+  assert.throws(() => assertTargetDeviceAllowed(info, "0000811000123456789012345"), (error) => error.code === "INVALID_TARGET_UDID");
+  assert.throws(() => assertTargetDeviceAllowed(info, "00008110-001234567890123Z"), (error) => error.code === "INVALID_TARGET_UDID");
 });
