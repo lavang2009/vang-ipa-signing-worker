@@ -50,7 +50,7 @@ Health check sẵn sàng chỉ khi có:
   "signBlob": true,
   "corsConfigured": true,
   "firebaseProjectId": "your-firebase-project-id",
-  "build": "ipa-signing-udid-25-40-2026-11-19",
+  "build": "ipa-signing-pkcs12-reader-fix-2026-11-19",
   "zsignVersion": "..."
 }
 ```
@@ -101,7 +101,7 @@ The worker now requires the `openssl` CLI and the `plist` Node package to inspec
 
 The signing endpoint accepts valid Apple iOS provisioning profiles across the common categories: Ad Hoc, In-House/Enterprise, Development, and App Store, plus structurally valid variants that ZSign may support. A profile must still pass CMS verification, required-field validation, expiry checks, App ID compatibility, and final ZSign certificate/profile compatibility.
 
-The Website does not ask for a manually entered UDID. Ad Hoc and Development profiles retain their original `ProvisionedDevices` list inside the signed app; iOS enforces that device allow-list when installing/running the app. Removing the text field does not register additional devices or make an unlisted device eligible. Enterprise and App Store profiles do not use that device list.
+The signing Website asks the user to copy a 25-character or 40-character UDID from UDID CodeVN and paste it into the form. The Website does not generate a UDID configuration file. For Ad Hoc and Development profiles, the Worker checks a submitted UDID against the profile's `ProvisionedDevices` list; this check does not filter the P12/PFX certificate. Enterprise and App Store profiles do not use that device list.
 
 Only Ad Hoc and eligible In-House/Enterprise profiles receive an `itms-services` manifest link. Development profiles use registered-device development workflows; App Store profiles are for App Store Connect and are not directly installable through an OTA manifest. Every successful signing result retains a private IPA download link as fallback.
 
@@ -116,4 +116,4 @@ If decoding fails, Runtime Logs include the OpenSSL strategy, exit code and a sh
 
 Test locally with `npm test`; the CMS decoder tests generate a temporary synthetic profile signed by a disposable test certificate and never use production credentials.
 
-Expected Worker health build: `ipa-signing-udid-25-40-2026-11-19`.
+Expected Worker health build: `ipa-signing-pkcs12-reader-fix-2026-11-19`.

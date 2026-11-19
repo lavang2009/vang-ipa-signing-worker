@@ -15,6 +15,7 @@ import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { parse as parsePlist } from "plist";
 import { decodeProvisioningProfile } from "./provisioning-profile.js";
+import { preparePkcs12ForSigning } from "./pkcs12.js";
 import { applyCors, buildAllowedOrigins } from "./cors.js";
 import { isIpaSigningMaintenanceBlocked, normalizeIpaSigningMaintenance } from "./maintenance.js";
 import {
@@ -38,7 +39,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-signing-udid-25-40-2026-11-19";
+const workerBuild = "ipa-signing-pkcs12-reader-fix-2026-11-19";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -331,6 +332,7 @@ async function writeAudit(uid, status, details = {}) {
       appNameChanged: Boolean(details.appNameChanged),
       durationMs: Number(details.durationMs || 0),
       errorCode: details.errorCode || null,
+      requestId: details.requestId || null,
       createdAt: FieldValue.serverTimestamp(),
     });
   } catch (error) {
@@ -367,8 +369,8 @@ function friendlySigningError(error) {
   if (error?.code === "BLOB_NOT_FOUND") return raw;
   if (error?.code === "SIGNING_TIMEOUT") return "Quá thời gian ký IPA. Hãy thử IPA nhỏ hơn hoặc liên hệ quản trị viên kiểm tra worker.";
   if (error?.code === "SIGNING_FAILED") {
-    if (/mac verify error|password|pkcs12|bad decrypt|unable to load private key/.test(lower)) return "Không đọc được P12. Kiểm tra file chứng chỉ và mật khẩu P12 (nếu tệp có mật khẩu).";
-    if (/provision|profile|entitlement|bundle identifier|application-identifier/.test(lower)) return "Provisioning profile không tương thích với chứng chỉ, Bundle ID hoặc quyền của ứng dụng.";
+    if (/mac verify error|password|pkcs12|bad decrypt|unable to load private key/.test(lower)) return "ZSign không giải mã được P12/PFX. Hãy kiểm tra mật khẩu; nếu không đặt mật khẩu thì để trống. Worker đã tự chuyển đổi P12 dùng mã hóa PKCS#12 cũ khi có thể.";
+    if (/provision|profile|entitlement|bundle identifier|application-identifier/.test(lower)) return "Provisioning Profile đã được giải mã, nhưng ZSign từ chối ký với cặp chứng chỉ/profile hoặc Bundle ID này. Dùng chứng chỉ có khóa riêng được liệt kê trong DeveloperCertificates của profile và kiểm tra App ID/entitlements.";
     return "ZSign không thể ký IPA này. Hãy kiểm tra chứng chỉ còn hạn, profile phù hợp và thử lại bằng bộ tệp hợp lệ.";
   }
   if (error?.code === "INVALID_PROVISIONING_PROFILE_CMS") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_CMS). Worker đã thử CMS DER, PEM và S/MIME; xem Runtime Logs để biết lỗi OpenSSL cụ thể.`;
@@ -377,6 +379,8 @@ function friendlySigningError(error) {
   if (error?.code === "INVALID_PROVISIONING_PROFILE_PLIST") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_PLIST). CMS hợp lệ nhưng payload bên trong không phải plist mà Worker đọc được.`;
   if (error?.code === "INCOMPLETE_PROVISIONING_PROFILE") return `${raw} (Mã: INCOMPLETE_PROVISIONING_PROFILE). Profile thiếu trường bắt buộc; hãy tải lại từ Apple Developer.`;
   if (error?.code === "INVALID_PROVISIONING_PROFILE_SIZE") return raw;
+  if (error?.code === "INVALID_PKCS12") return raw;
+  if (error?.code === "PKCS12_TIMEOUT") return "Quá thời gian đọc P12/PFX. Hãy thử lại hoặc kiểm tra tệp chứng chỉ.";
   if (error?.code === "ENOENT") return "Signing worker thiếu chương trình unzip, OpenSSL hoặc ZSign. Hãy liên hệ quản trị viên.";
   return raw || "Không thể xử lý tệp ký IPA.";
 }
@@ -409,12 +413,13 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     }
 
     await assertIpaStructure(ipa.path);
+    const signingP12Path = await preparePkcs12ForSigning(p12.path, req.workDir, p12Password);
     const rawProvisioningProfile = await decodeProvisioningProfile(profile.path);
     const provisioningProfileInfo = assertProvisioningProfileUsable(classifyProvisioningProfile(rawProvisioningProfile));
     const targetDeviceCheck = assertTargetDeviceAllowed(provisioningProfileInfo, targetUdid);
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
-    const args = ["-f", "-k", p12.path];
+    const args = ["-f", "-k", signingP12Path];
     if (p12Password) args.push("-p", p12Password);
     args.push("-m", profile.path);
     if (bundleId) args.push("-b", bundleId);
@@ -437,6 +442,7 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     await writeAudit(req.user.uid, "success", {
       ipaSize: ipa.size, p12Size: p12.size, profileSize: profile.size,
       bundleIdChanged: Boolean(bundleId), appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
+      requestId: req.requestId,
     });
     res.setHeader("X-Signing-Engine", "ZSign");
     res.setHeader("Cache-Control", "no-store, private");
@@ -452,9 +458,9 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
       ipaSize: ipa?.size, p12Size: p12?.size, profileSize: profile?.size,
       bundleIdChanged: Boolean(String(req.body.bundleId || "").trim()),
       appNameChanged: Boolean(String(req.body.appName || "").trim()),
-      durationMs: Date.now() - startedAt, errorCode: auditCode,
+      durationMs: Date.now() - startedAt, errorCode: auditCode, requestId: req.requestId,
     });
-    res.status(error?.message?.startsWith("Bạn đã đạt giới hạn") ? 429 : 400).json({ error: message });
+    res.status(error?.message?.startsWith("Bạn đã đạt giới hạn") ? 429 : 400).json({ error: message, code: auditCode, requestId: req.requestId });
     await fs.rm(req.workDir, { recursive: true, force: true }).catch(() => {});
   }
 });
@@ -551,6 +557,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     profileSize = await downloadPrivateChunksToFile(profilePaths, profilePath, maxProfileFileBytes, "Provisioning Profile");
 
     await assertIpaStructure(ipaPath);
+    const signingP12Path = await preparePkcs12ForSigning(p12Path, req.workDir, p12Password);
 
     const rawProvisioningProfile = await decodeProvisioningProfile(profilePath);
     const provisioningProfileInfo = assertProvisioningProfileUsable(
@@ -560,7 +567,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     // Consume quota only after the IPA, P12/PFX, provisioning profile and optional device check pass.
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
-    const args = ["-f", "-k", p12Path];
+    const args = ["-f", "-k", signingP12Path];
     if (p12Password) args.push("-p", p12Password);
     args.push("-m", profilePath);
     if (bundleId) args.push("-b", bundleId);
@@ -653,6 +660,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     await writeAudit(req.user.uid, "success", {
       ipaSize, p12Size, profileSize, bundleIdChanged: Boolean(bundleId),
       appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
+      requestId: req.requestId,
       profileType: provisioningProfileInfo.type,
       registeredDeviceCount: provisioningProfileInfo.registeredDeviceCount,
     });
@@ -663,6 +671,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       installUrl,
       manifestUrl,
       installation,
+      requestId: req.requestId,
     });
   } catch (error) {
     auditCode = error?.code || "VALIDATION_OR_SIGNING_ERROR";
@@ -673,13 +682,13 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     const message = friendlySigningError(error);
     await writeAudit(req.user.uid, "failed", {
       ipaSize, p12Size, profileSize, bundleIdChanged: Boolean(bundleId),
-      appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt, errorCode: auditCode,
+      appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt, errorCode: auditCode, requestId: req.requestId,
     });
     const status = error?.code === "SIGNING_TIMEOUT" ? 504
       : message.startsWith("Bạn đã đạt giới hạn") ? 429
       : error?.code === "BLOB_NOT_FOUND" ? 404
       : 400;
-    return res.status(status).json({ error: message });
+    return res.status(status).json({ error: message, code: auditCode, requestId: req.requestId });
   } finally {
     const toDelete = [...ipaPaths, ...p12Paths, ...profilePaths];
     if (toDelete.length && blobReady) await del(toDelete).catch((error) => console.error("Could not delete private input chunks:", error instanceof Error ? error.message : "unknown"));

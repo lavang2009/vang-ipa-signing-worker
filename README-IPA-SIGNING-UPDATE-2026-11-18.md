@@ -18,7 +18,7 @@ Bản cập nhật gồm hai dự án độc lập: website Next.js và signing 
 - Không còn giải nén ZIP chứng chỉ. Việc đọc cấu trúc ZIP chỉ dùng với chính tệp `.ipa`.
 - Worker tự xác minh Firebase token và quyền Admin; Admin tiếp tục ký được trong lúc bảo trì, user thường bị chặn ở API ký.
 - Dọn các Blob tạm IPA/P12/profile sau khi xử lý.
-- Health build hiện tại: `ipa-signing-udid-25-40-2026-11-19`.
+- Health build hiện tại trong bản sửa parser P12/PFX: `ipa-signing-pkcs12-reader-fix-2026-11-19`.
 
 ## Cách triển khai
 
@@ -39,7 +39,7 @@ Không cần thêm package/dependency mới. Bản cập nhật không yêu cầ
 - Mở `/sign-ipa` với tài khoản thường khi bảo trì tắt: trang hiển thị biểu mẫu đăng nhập và ký bình thường.
 - Bật bảo trì: tài khoản thường thấy thông báo bảo trì; Admin đã đăng nhập vẫn thấy biểu mẫu và có thể gửi ký. Cả API chunk và Worker cũng kiểm tra quyền này.
 - Với phiên ký: chọn IPA, P12/PFX riêng, `.mobileprovision` riêng; nhập mật khẩu P12 nếu có; để trống nếu không có.
-- Kiểm tra `/healthz` trên Worker. Trường `build` phải là `ipa-signing-udid-25-40-2026-11-19`.
+- Kiểm tra `/healthz` trên Worker. Trường `build` phải là `ipa-signing-pkcs12-reader-fix-2026-11-19`.
 
 ## Kiểm định đã chạy
 
