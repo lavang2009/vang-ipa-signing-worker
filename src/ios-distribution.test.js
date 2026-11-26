@@ -12,6 +12,8 @@ import {
   buildOtaManifestXml,
   classifyProvisioningProfile,
   isBundleIdentifierAllowed,
+  matchBundleIdentifierToApplicationIdentifier,
+  evaluateProvisioningProfileBundleCompatibility,
 } from "./ios-distribution.js";
 
 const future = new Date(Date.now() + 86_400_000);
@@ -43,6 +45,8 @@ test("classifies a registered-device profile as Ad Hoc and exposes safe App ID d
   assert.equal(info.expiresAt, future.toISOString());
   assert.equal(info.appIdPrefix, "ABCDE12345");
   assert.equal(info.profileBundlePattern, "com.example.app");
+  assert.equal(info.appIdType, "explicit");
+  assert.deepEqual(info.applicationIdentifiers, ["ABCDE12345.com.example.app"]);
   assert.equal(info.profileName, "Test profile");
   assert.equal(info.profileUuid, "PROFILE-UUID-1");
   assert.deepEqual(info.teamIdentifiers, ["TEAM123456"]);
@@ -65,6 +69,88 @@ test("matches exact and wildcard App IDs", () => {
   assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.*", "com.other.demo"), false);
   assert.equal(isBundleIdentifierAllowed("ABCDE12345.*", "com.example.app"), true);
   assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.app", "com.example.other"), false);
+});
+
+
+test("auto-detects Explicit App IDs and returns an exact-match compatibility result", () => {
+  const result = matchBundleIdentifierToApplicationIdentifier(
+    "ABCDE12345.com.example.app",
+    "com.example.app",
+  );
+  assert.deepEqual(result, {
+    matched: true,
+    appIdType: "explicit",
+    appIdPrefix: "ABCDE12345",
+    profileBundlePattern: "com.example.app",
+    matchReason: "EXPLICIT_APP_ID_EXACT_MATCH",
+  });
+  assert.equal(matchBundleIdentifierToApplicationIdentifier(
+    "ABCDE12345.com.example.app", "com.example.other",
+  ).matched, false);
+});
+
+test("auto-detects Wildcard App IDs and matches only bundle identifiers below the fixed prefix", () => {
+  const profile = classifyProvisioningProfile(adhocProfile({
+    Entitlements: {
+      "get-task-allow": false,
+      "application-identifier": "ABCDE12345.com.example.*",
+    },
+  }));
+  assert.equal(profile.appIdType, "wildcard");
+  assert.equal(isBundleIdentifierAllowed(profile.applicationIdentifier, "com.example.app"), true);
+  assert.equal(isBundleIdentifierAllowed(profile.applicationIdentifier, "com.example.app.share"), true);
+  assert.equal(isBundleIdentifierAllowed(profile.applicationIdentifier, "com.example"), false);
+  assert.equal(isBundleIdentifierAllowed(profile.applicationIdentifier, "com.exampleevil.app"), false);
+});
+
+test("supports the global trailing wildcard App ID while preserving a valid Bundle ID", () => {
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.*", "com.example.app"), true);
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.*", "org.vendor.tool.extension"), true);
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.*", "not-a-bundle-id"), false);
+});
+
+test("validates both application-identifier entitlement keys when a profile contains both", () => {
+  const info = classifyProvisioningProfile({
+    ExpirationDate: future,
+    Entitlements: {
+      "application-identifier": "ABCDE12345.com.example.app",
+      "com.apple.application-identifier": "ABCDE12345.com.example.*",
+    },
+  });
+  assert.deepEqual(info.applicationIdentifiers, [
+    "ABCDE12345.com.example.app",
+    "ABCDE12345.com.example.*",
+  ]);
+  assert.equal(assertBundleIdentifierAllowed(info.applicationIdentifiers, "com.example.app", info), true);
+  assert.throws(
+    () => assertBundleIdentifierAllowed([
+      "ABCDE12345.com.example.*",
+      "ABCDE12345.com.other.*",
+    ], "com.example.app", info),
+    (error) => error.code === "BUNDLE_ID_PROFILE_MISMATCH" && error.details.matches.length === 2,
+  );
+});
+
+test("reports the selected profile mode and individual App ID match reasons", () => {
+  const result = evaluateProvisioningProfileBundleCompatibility(
+    ["ABCDE12345.com.example.*"],
+    "com.example.app",
+  );
+  assert.equal(result.compatible, true);
+  assert.equal(result.appIdType, "wildcard");
+  assert.equal(result.matchMode, "WILDCARD");
+  assert.equal(result.matches[0].matchReason, "WILDCARD_APP_ID_MATCH");
+});
+
+test("rejects malformed or non-terminal wildcard application identifiers", () => {
+  for (const invalid of [
+    "ABCDE12345.com.*.app",
+    "ABCDE12345.com.example.*.child",
+    "ABCDE12345.com.example.**",
+    "ABCDE12345.com..example.*",
+  ]) {
+    assert.equal(isBundleIdentifierAllowed(invalid, "com.example.app"), false, invalid);
+  }
 });
 
 test("uses App ID Prefix from application-identifier, not an assumed Team ID", () => {
@@ -107,7 +193,7 @@ test("rejects the reported IPA/profile pair while preserving the original Bundle
       error.details.sourceBundleIdentifier === sourceBundleId &&
       error.details.applicationIdentifier === profileApplicationIdentifier &&
       error.details.profileBundlePattern === "com.Azor255588.Azor" &&
-      error.details.nextAction === "DOWNLOAD_MATCHING_PROVISIONING_PROFILE_FROM_APPLE_DEVELOPER",
+      error.details.nextAction === "SELECT_EXPLICIT_MATCH_OR_VALID_WILDCARD_PROFILE",
   );
 });
 
@@ -147,7 +233,7 @@ test("mismatch diagnostics explain the exact profile pattern and preserve-source
       error.details.sourceBundleIdentifier === "p3.xyz.yyyue.esign" &&
       error.details.profileName === "Azor Profile" &&
       error.details.policy === "PRESERVE_SOURCE_BUNDLE_ID" &&
-      error.details.nextAction === "DOWNLOAD_MATCHING_PROVISIONING_PROFILE_FROM_APPLE_DEVELOPER",
+      error.details.nextAction === "SELECT_EXPLICIT_MATCH_OR_VALID_WILDCARD_PROFILE",
   );
 });
 
@@ -190,6 +276,22 @@ test("reads the macOS/Catalyst application-identifier entitlement fallback", () 
   });
   assert.equal(info.applicationIdentifier, "LEGACYPREFIX.com.example.catalyst");
   assert.equal(isBundleIdentifierAllowed(info.applicationIdentifier, "com.example.catalyst"), true);
+});
+
+test("rejects Wildcard App ID for App Store Connect profiles", () => {
+  const profile = classifyProvisioningProfile({
+    ExpirationDate: future,
+    Entitlements: {
+      "get-task-allow": false,
+      "application-identifier": "ABCDE12345.com.example.*",
+    },
+  });
+  assert.equal(profile.type, "app-store");
+  assert.equal(profile.appIdType, "wildcard");
+  assert.throws(
+    () => assertProvisioningProfileUsable(profile),
+    (error) => error.code === "APP_STORE_REQUIRES_EXPLICIT_APP_ID",
+  );
 });
 
 test("allows valid non-Ad Hoc profiles to pass profile eligibility checks", () => {

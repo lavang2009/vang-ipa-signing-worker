@@ -23,10 +23,26 @@ export function classifyProvisioningProfile(profile) {
       ? new Date(rawExpiration)
       : null;
 
-  const applicationIdentifier = typeof (profile?.Entitlements?.["application-identifier"] || profile?.Entitlements?.["com.apple.application-identifier"]) === "string"
-    ? (profile.Entitlements["application-identifier"] || profile.Entitlements["com.apple.application-identifier"])
-    : "";
+  const entitlements = profile?.Entitlements && typeof profile.Entitlements === "object"
+    ? profile.Entitlements
+    : {};
+  // iOS normally uses application-identifier. Mac Catalyst profiles can
+  // carry com.apple.application-identifier as well; validate every supplied
+  // value rather than silently preferring one if the two disagree.
+  const applicationIdentifiers = [...new Set([
+    entitlements["application-identifier"],
+    entitlements["com.apple.application-identifier"],
+  ].filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim()))];
+  const applicationIdentifier = applicationIdentifiers[0] || "";
   const appIdSeparator = applicationIdentifier.indexOf(".");
+  const profileBundlePattern = appIdSeparator > 0 ? applicationIdentifier.slice(appIdSeparator + 1) : "";
+  const appIdTypes = [...new Set(applicationIdentifiers.map((value) =>
+    parseProfileApplicationIdentifier(value)?.appIdType || "unknown",
+  ))];
+  const appIdType = appIdTypes.length === 1 ? appIdTypes[0] : appIdTypes.length ? "mixed" : "unknown";
+  const hasWildcardAppId = applicationIdentifiers.some((value) =>
+    parseProfileApplicationIdentifier(value)?.appIdType === "wildcard",
+  );
 
   return {
     type,
@@ -36,8 +52,11 @@ export function classifyProvisioningProfile(profile) {
       ? expirationDate.toISOString()
       : null,
     applicationIdentifier,
+    applicationIdentifiers,
+    appIdType,
+    hasWildcardAppId,
     appIdPrefix: appIdSeparator > 0 ? applicationIdentifier.slice(0, appIdSeparator) : "",
-    profileBundlePattern: appIdSeparator > 0 ? applicationIdentifier.slice(appIdSeparator + 1) : "",
+    profileBundlePattern,
     profileName: typeof profile?.Name === "string" ? profile.Name : "",
     profileUuid: typeof profile?.UUID === "string" ? profile.UUID : "",
     teamIdentifiers: Array.isArray(profile?.TeamIdentifier)
@@ -58,6 +77,11 @@ export function assertProvisioningProfileUsable(profileInfo, now = Date.now()) {
   }
   if (!profileInfo.applicationIdentifier || !profileInfo.applicationIdentifier.includes(".")) {
     throw new Error("Provisioning Profile thiếu application-identifier hợp lệ.");
+  }
+  if (profileInfo.type === "app-store" && profileInfo.hasWildcardAppId) {
+    const error = new Error("App Store Connect yêu cầu Explicit App ID. Wildcard Profile chỉ dùng cho các luồng phân phối được Apple cho phép; hãy chọn profile Explicit đúng Bundle ID.");
+    error.code = "APP_STORE_REQUIRES_EXPLICIT_APP_ID";
+    throw error;
   }
   return profileInfo;
 }
@@ -93,51 +117,112 @@ export function assertTargetDeviceAllowed(profileInfo, targetUdid) {
 }
 
 const BUNDLE_IDENTIFIER_PATTERN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+const APP_ID_PATTERN_COMPONENTS = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$/;
+
+function parseProfileApplicationIdentifier(applicationIdentifier) {
+  if (typeof applicationIdentifier !== "string" || !applicationIdentifier.trim()) return null;
+  const value = applicationIdentifier.trim();
+  const separator = value.indexOf(".");
+  if (separator < 1 || separator === value.length - 1) return null;
+
+  const appIdPrefix = value.slice(0, separator);
+  const profileBundlePattern = value.slice(separator + 1);
+  if (!/^[A-Za-z0-9-]+$/.test(appIdPrefix)) return null;
+
+  if (profileBundlePattern === "*") {
+    return { appIdPrefix, profileBundlePattern, appIdType: "wildcard", wildcardBase: "" };
+  }
+
+  if (!profileBundlePattern.includes("*")) {
+    if (!BUNDLE_IDENTIFIER_PATTERN.test(profileBundlePattern)) return null;
+    return { appIdPrefix, profileBundlePattern, appIdType: "explicit", wildcardBase: null };
+  }
+
+  // Apple's wildcard App ID is a terminal wildcard only. Examples:
+  // TEAMID.com.example.* and TEAMID.*. It matches IDs beginning with the
+  // fixed prefix plus a dot, not the fixed prefix itself.
+  if (!profileBundlePattern.endsWith(".*") || (profileBundlePattern.match(/\*/g) || []).length !== 1) return null;
+  const wildcardBase = profileBundlePattern.slice(0, -2);
+  if (!wildcardBase || !APP_ID_PATTERN_COMPONENTS.test(wildcardBase)) return null;
+  return { appIdPrefix, profileBundlePattern, appIdType: "wildcard", wildcardBase };
+}
+
+/** Return detailed, non-secret information about one profile App ID match. */
+export function matchBundleIdentifierToApplicationIdentifier(applicationIdentifier, bundleIdentifier) {
+  const bundleId = typeof bundleIdentifier === "string" ? bundleIdentifier.trim() : "";
+  const parsed = parseProfileApplicationIdentifier(applicationIdentifier);
+  if (!BUNDLE_IDENTIFIER_PATTERN.test(bundleId) || !parsed) {
+    return {
+      matched: false,
+      appIdType: parsed?.appIdType || "unknown",
+      appIdPrefix: parsed?.appIdPrefix || null,
+      profileBundlePattern: parsed?.profileBundlePattern || (typeof applicationIdentifier === "string" ? applicationIdentifier : null),
+      matchReason: "INVALID_APP_ID_OR_BUNDLE_ID",
+    };
+  }
+
+  if (parsed.appIdType === "explicit") {
+    const matched = parsed.profileBundlePattern === bundleId;
+    return {
+      matched,
+      appIdType: "explicit",
+      appIdPrefix: parsed.appIdPrefix,
+      profileBundlePattern: parsed.profileBundlePattern,
+      matchReason: matched ? "EXPLICIT_APP_ID_EXACT_MATCH" : "EXPLICIT_APP_ID_MISMATCH",
+    };
+  }
+
+  const matched = parsed.wildcardBase === ""
+    ? true
+    : bundleId.startsWith(`${parsed.wildcardBase}.`) && bundleId.length > parsed.wildcardBase.length + 1;
+  return {
+    matched,
+    appIdType: "wildcard",
+    appIdPrefix: parsed.appIdPrefix,
+    profileBundlePattern: parsed.profileBundlePattern,
+    matchReason: matched ? "WILDCARD_APP_ID_MATCH" : "WILDCARD_APP_ID_PREFIX_MISMATCH",
+  };
+}
 
 /**
- * Match the bundle identifier against the App ID in a provisioning profile.
- * Apple defines application-identifier as <App ID Prefix>.<Bundle ID>.
- * The prefix is NOT always the Team ID, so deliberately compare only the
- * profile's suffix after its first dot. Wildcards are supported only as the
- * complete App ID (`*`) or as the final component (`com.example.*`).
+ * Evaluate every application-identifier entitlement present in a profile.
+ * This matters for Mac Catalyst profiles that can include both keys. All
+ * provided identifiers must authorize the exact original Bundle ID.
  */
+export function evaluateProvisioningProfileBundleCompatibility(profileOrIdentifiers, bundleIdentifier) {
+  const identifiers = Array.isArray(profileOrIdentifiers)
+    ? profileOrIdentifiers
+    : profileOrIdentifiers && typeof profileOrIdentifiers === "object"
+      ? (Array.isArray(profileOrIdentifiers.applicationIdentifiers) && profileOrIdentifiers.applicationIdentifiers.length
+          ? profileOrIdentifiers.applicationIdentifiers
+          : [profileOrIdentifiers.applicationIdentifier || profileOrIdentifiers.Entitlements?.["application-identifier"] || profileOrIdentifiers.Entitlements?.["com.apple.application-identifier"]])
+      : [profileOrIdentifiers];
+  const uniqueIdentifiers = [...new Set(identifiers.filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim()))];
+  const matches = uniqueIdentifiers.map((identifier) => ({
+    applicationIdentifier: identifier,
+    ...matchBundleIdentifierToApplicationIdentifier(identifier, bundleIdentifier),
+  }));
+  const compatible = matches.length > 0 && matches.every((item) => item.matched);
+  const appIdTypes = [...new Set(matches.map((item) => item.appIdType))];
+  return {
+    compatible,
+    bundleIdentifier: typeof bundleIdentifier === "string" ? bundleIdentifier.trim() : null,
+    appIdType: appIdTypes.length === 1 ? appIdTypes[0] : appIdTypes.length ? "mixed" : "unknown",
+    matchMode: compatible ? (appIdTypes.length === 1 ? appIdTypes[0].toUpperCase() : "MULTIPLE_APP_ID_ENTITLEMENTS") : "NO_MATCH",
+    matches,
+  };
+}
+
+/** Backwards-compatible boolean helper used by tests and API integrations. */
 export function isBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier) {
-  if (typeof applicationIdentifier !== "string" || !applicationIdentifier.trim()) return false;
-  if (typeof bundleIdentifier !== "string" || !bundleIdentifier.trim()) return false;
-
-  const appId = applicationIdentifier.trim();
-  const bundleId = bundleIdentifier.trim();
-  if (!BUNDLE_IDENTIFIER_PATTERN.test(bundleId)) return false;
-
-  const separator = appId.indexOf(".");
-  if (separator < 1 || separator === appId.length - 1) return false;
-
-  const appIdPrefix = appId.slice(0, separator);
-  const profilePattern = appId.slice(separator + 1);
-  if (!appIdPrefix || appIdPrefix.includes("*") || !profilePattern) return false;
-
-  if (profilePattern === "*") return true;
-  if (profilePattern === bundleId) return true;
-
-  // Apple wildcard App IDs must have a single trailing wildcard. Require at
-  // least one complete bundle-ID component after the fixed prefix.
-  if (profilePattern.endsWith(".*") && !profilePattern.slice(0, -1).includes("*")) {
-    const fixedPrefix = profilePattern.slice(0, -1); // includes final dot
-    return bundleId.startsWith(fixedPrefix) && bundleId.length > fixedPrefix.length;
-  }
-  return false;
+  return evaluateProvisioningProfileBundleCompatibility(applicationIdentifier, bundleIdentifier).compatible;
 }
 
 /** Fail early, before consuming quota or invoking ZSign, with safe diagnostics. */
 export function getApplicationIdentifierParts(applicationIdentifier) {
-  if (typeof applicationIdentifier !== "string") return null;
-  const value = applicationIdentifier.trim();
-  const separator = value.indexOf(".");
-  if (separator < 1 || separator === value.length - 1) return null;
-  const appIdPrefix = value.slice(0, separator);
-  const profileBundlePattern = value.slice(separator + 1);
-  if (!/^[A-Za-z0-9-]+$/.test(appIdPrefix) || !profileBundlePattern) return null;
-  return { appIdPrefix, profileBundlePattern };
+  const parsed = parseProfileApplicationIdentifier(applicationIdentifier);
+  if (!parsed) return null;
+  return { appIdPrefix: parsed.appIdPrefix, profileBundlePattern: parsed.profileBundlePattern };
 }
 
 /** Preserve the IPA's embedded CFBundleIdentifier. This signing workflow must
@@ -165,27 +250,34 @@ export function assertOriginalBundleIdentifier(sourceBundleIdentifier, requested
   return source;
 }
 
-export function assertBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier, profileInfo = {}) {
-  if (isBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier)) return true;
+export function assertBundleIdentifierAllowed(applicationIdentifierOrList, bundleIdentifier, profileInfo = {}) {
+  const compatibility = evaluateProvisioningProfileBundleCompatibility(applicationIdentifierOrList, bundleIdentifier);
+  if (compatibility.compatible) return true;
 
-  const parts = getApplicationIdentifierParts(applicationIdentifier);
-  const bundlePattern = parts?.profileBundlePattern || "(không đọc được)";
-  const prefix = parts?.appIdPrefix || "(không đọc được)";
+  const matches = compatibility.matches;
+  const first = matches[0] || {};
+  const applicationIdentifier = matches.map((item) => item.applicationIdentifier).join("; ") || "(thiếu)";
+  const profileBundlePattern = first.profileBundlePattern || "(không đọc được)";
+  const appIdPrefix = first.appIdPrefix || null;
   const error = new Error(
-    `Provisioning Profile không cấp quyền cho Bundle ID gốc của IPA. IPA: "${String(bundleIdentifier || "(trống)")}"; App ID trong profile: "${String(applicationIdentifier || "(thiếu)")}". Hãy giữ nguyên Bundle ID và tải profile được tạo cho đúng App ID này từ Apple Developer. Worker không tự đổi Bundle ID hoặc bỏ qua entitlement.`,
+    `Provisioning Profile không cấp quyền cho Bundle ID gốc của IPA. IPA: "${String(bundleIdentifier || "(trống)")}"; App ID trong profile: "${applicationIdentifier}". Worker tự nhận diện cả Explicit và Wildcard App ID nhưng profile này không khớp. Hãy chọn profile có App ID phù hợp; không đổi Bundle ID hoặc bỏ qua entitlement.`,
   );
   error.code = "BUNDLE_ID_PROFILE_MISMATCH";
   error.details = {
     bundleIdentifier: typeof bundleIdentifier === "string" ? bundleIdentifier : null,
     sourceBundleIdentifier: typeof bundleIdentifier === "string" ? bundleIdentifier : null,
-    applicationIdentifier: typeof applicationIdentifier === "string" ? applicationIdentifier : null,
-    appIdPrefix: parts?.appIdPrefix || null,
-    profileBundlePattern: parts?.profileBundlePattern || null,
+    applicationIdentifier: matches.length <= 1 ? (matches[0]?.applicationIdentifier || null) : matches.map((item) => item.applicationIdentifier),
+    applicationIdentifiers: matches.map((item) => item.applicationIdentifier),
+    appIdPrefix,
+    profileBundlePattern,
+    appIdType: compatibility.appIdType,
+    matchMode: compatibility.matchMode,
+    matches,
     profileName: profileInfo.profileName || null,
     profileUuid: profileInfo.profileUuid || null,
     teamIdentifiers: Array.isArray(profileInfo.teamIdentifiers) ? profileInfo.teamIdentifiers : [],
     policy: "PRESERVE_SOURCE_BUNDLE_ID",
-    nextAction: "DOWNLOAD_MATCHING_PROVISIONING_PROFILE_FROM_APPLE_DEVELOPER",
+    nextAction: "SELECT_EXPLICIT_MATCH_OR_VALID_WILDCARD_PROFILE",
   };
   throw error;
 }

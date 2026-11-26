@@ -1,4 +1,10 @@
 # VANG STORE — IPA Signing Worker (Vercel Container)
+## Explicit and Wildcard Provisioning Profile preflight (2026-11-26)
+
+The signing endpoints `/v1/sign` and `/v1/sign-blob` automatically classify the profile App ID as Explicit or Wildcard and validate it against the IPA's original `CFBundleIdentifier` before quota is consumed and before ZSign runs. If both `application-identifier` and `com.apple.application-identifier` are present, each value must authorize the same Bundle ID. The worker preserves the IPA Bundle ID and does not pass ZSign's `-b` option. It also verifies that the P12 certificate is listed in the profile's `DeveloperCertificates`, and re-checks the Bundle ID in the signed IPA.
+
+Apple wildcard App IDs use a terminal wildcard (for example, `TEAMID.com.example.*`) and match Bundle IDs that begin with the fixed prefix followed by a dot. A wildcard match does not grant capabilities that require an Explicit App ID; Apple profile entitlements, certificate authorization, expiration, and device restrictions remain authoritative. App Store Connect profile type is restricted to Explicit App IDs. The current request API accepts one provisioning profile; apps with extensions that require separate explicit profiles need a matching multi-profile workflow.
+
 
 Worker chạy ZSign thật, xác thực Firebase ID Token, ghi quota/audit vào Firestore và đọc/ghi tệp IPA thông qua cùng một Vercel Blob Private Store với website.
 

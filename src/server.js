@@ -27,6 +27,7 @@ import {
   buildItmsServicesUrl,
   buildOtaManifestXml,
   classifyProvisioningProfile,
+  evaluateProvisioningProfileBundleCompatibility,
   isSupportedUdid,
 } from "./ios-distribution.js";
 import { del, get, issueSignedToken, presignUrl, put } from "@vercel/blob";
@@ -41,7 +42,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-signing-preserve-original-bundle-id-zsign-preflight-2026-11-26";
+const workerBuild = "ipa-signing-explicit-wildcard-profile-preflight-2026-11-26";
 const zsignSource = "https://github.com/zhlynn/zsign";
 
 // Keep the CORS allow-list strict and independently unit-tested.
@@ -351,6 +352,9 @@ async function writeAudit(uid, status, details = {}) {
       durationMs: Number(details.durationMs || 0),
       errorCode: details.errorCode || null,
       requestId: details.requestId || null,
+      profileAppIdType: details.profileAppIdType || null,
+      profileBundlePattern: details.profileBundlePattern || null,
+      appIdMatchMode: details.appIdMatchMode || null,
       createdAt: FieldValue.serverTimestamp(),
     });
   } catch (error) {
@@ -445,7 +449,18 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     const expectedBundleIdentifier = assertOriginalBundleIdentifier(sourceMetadata.bundleIdentifier, bundleId);
     // Preserve the original IPA Bundle ID. The Apple-signed profile must authorize
     // this exact identifier; never rewrite the app just to fit an unrelated profile.
-    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, expectedBundleIdentifier, provisioningProfileInfo);
+    const profileAppIdentifiers = provisioningProfileInfo.applicationIdentifiers?.length
+      ? provisioningProfileInfo.applicationIdentifiers
+      : provisioningProfileInfo.applicationIdentifier;
+    const appIdCompatibility = evaluateProvisioningProfileBundleCompatibility(profileAppIdentifiers, expectedBundleIdentifier);
+    assertBundleIdentifierAllowed(profileAppIdentifiers, expectedBundleIdentifier, provisioningProfileInfo);
+    console.info("Provisioning Profile App ID preflight passed:", JSON.stringify({
+      requestId: req.requestId,
+      bundleIdentifier: expectedBundleIdentifier,
+      appIdType: appIdCompatibility.appIdType,
+      matchMode: appIdCompatibility.matchMode,
+      matches: appIdCompatibility.matches.map(({ applicationIdentifier, matched, matchReason }) => ({ applicationIdentifier, matched, matchReason })),
+    }));
     const signingCertificateFingerprints = await getPkcs12CertificateFingerprints(signingP12Path, p12Password);
     assertSigningCertificateInProfile(rawProvisioningProfile, signingCertificateFingerprints);
     await consumeDailyQuota(req.user.uid);
@@ -470,12 +485,19 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     await assertIpaStructure(outputPath);
     const signedMetadata = await readIpaAppMetadata(outputPath);
     assertSignedBundleIdentifier(expectedBundleIdentifier, signedMetadata.bundleIdentifier);
-    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, signedMetadata.bundleIdentifier);
+    assertBundleIdentifierAllowed(
+      provisioningProfileInfo.applicationIdentifiers?.length ? provisioningProfileInfo.applicationIdentifiers : provisioningProfileInfo.applicationIdentifier,
+      signedMetadata.bundleIdentifier,
+      provisioningProfileInfo,
+    );
     const outputName = safeInputName(path.basename(ipa.originalname, path.extname(ipa.originalname)) + "-signed", "vang-store-signed", ".ipa");
     auditCode = "OK";
     await writeAudit(req.user.uid, "success", {
       ipaSize: ipa.size, p12Size: p12.size, profileSize: profile.size,
       bundleIdChanged: false, appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
+      profileAppIdType: provisioningProfileInfo.appIdType,
+      profileBundlePattern: provisioningProfileInfo.profileBundlePattern,
+      appIdMatchMode: appIdCompatibility.matchMode,
       requestId: req.requestId,
     });
     res.setHeader("X-Signing-Engine", "ZSign");
@@ -605,7 +627,18 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     const expectedBundleIdentifier = assertOriginalBundleIdentifier(sourceMetadata.bundleIdentifier, bundleId);
     // Preserve the source app identity and validate both Apple profile entitlement
     // and P12 certificate authorization before consuming quota or running ZSign.
-    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, expectedBundleIdentifier, provisioningProfileInfo);
+    const profileAppIdentifiers = provisioningProfileInfo.applicationIdentifiers?.length
+      ? provisioningProfileInfo.applicationIdentifiers
+      : provisioningProfileInfo.applicationIdentifier;
+    const appIdCompatibility = evaluateProvisioningProfileBundleCompatibility(profileAppIdentifiers, expectedBundleIdentifier);
+    assertBundleIdentifierAllowed(profileAppIdentifiers, expectedBundleIdentifier, provisioningProfileInfo);
+    console.info("Provisioning Profile App ID preflight passed:", JSON.stringify({
+      requestId: req.requestId,
+      bundleIdentifier: expectedBundleIdentifier,
+      appIdType: appIdCompatibility.appIdType,
+      matchMode: appIdCompatibility.matchMode,
+      matches: appIdCompatibility.matches.map(({ applicationIdentifier, matched, matchReason }) => ({ applicationIdentifier, matched, matchReason })),
+    }));
     const signingCertificateFingerprints = await getPkcs12CertificateFingerprints(signingP12Path, p12Password);
     assertSigningCertificateInProfile(rawProvisioningProfile, signingCertificateFingerprints);
     await consumeDailyQuota(req.user.uid);
@@ -632,7 +665,11 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
 
     const appMetadata = await readIpaAppMetadata(outputPath);
     assertSignedBundleIdentifier(expectedBundleIdentifier, appMetadata.bundleIdentifier);
-    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, appMetadata.bundleIdentifier);
+    assertBundleIdentifierAllowed(
+      provisioningProfileInfo.applicationIdentifiers?.length ? provisioningProfileInfo.applicationIdentifiers : provisioningProfileInfo.applicationIdentifier,
+      appMetadata.bundleIdentifier,
+      provisioningProfileInfo,
+    );
 
     const sourceLabel = typeof body.originalName === "string" ? body.originalName : "vang-store";
     const outputName = safeInputName(path.basename(sourceLabel, path.extname(sourceLabel)) + "-signed", "vang-store-signed", ".ipa");
@@ -691,6 +728,9 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       registeredDeviceCount: provisioningProfileInfo.registeredDeviceCount,
       profileExpiresAt: provisioningProfileInfo.expiresAt,
       applicationIdentifier: provisioningProfileInfo.applicationIdentifier,
+      applicationIdentifiers: provisioningProfileInfo.applicationIdentifiers || [provisioningProfileInfo.applicationIdentifier].filter(Boolean),
+      appIdType: provisioningProfileInfo.appIdType || "unknown",
+      appIdMatchMode: appIdCompatibility.matchMode,
       appIdPrefix: provisioningProfileInfo.appIdPrefix || null,
       profileBundlePattern: provisioningProfileInfo.profileBundlePattern || null,
       profileName: provisioningProfileInfo.profileName || null,
@@ -707,6 +747,9 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     await writeAudit(req.user.uid, "success", {
       ipaSize, p12Size, profileSize, bundleIdChanged: false,
       appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
+      profileAppIdType: provisioningProfileInfo.appIdType,
+      profileBundlePattern: provisioningProfileInfo.profileBundlePattern,
+      appIdMatchMode: appIdCompatibility.matchMode,
       requestId: req.requestId,
       profileType: provisioningProfileInfo.type,
       registeredDeviceCount: provisioningProfileInfo.registeredDeviceCount,
