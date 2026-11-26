@@ -13,7 +13,7 @@ import multer from "multer";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
-import { parse as parsePlist } from "plist";
+import { parseIpaInfoPlist } from "./ipa-info-plist.js";
 import { decodeProvisioningProfile } from "./provisioning-profile.js";
 import { preparePkcs12ForSigning } from "./pkcs12.js";
 import { applyCors, buildAllowedOrigins } from "./cors.js";
@@ -39,7 +39,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-signing-profile-plist-payload-fix-2026-11-26";
+const workerBuild = "ipa-signing-info-plist-format-fix-2026-11-26";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -280,7 +280,8 @@ async function readIpaAppMetadata(ipaPath) {
     maxBuffer: 8 * 1024 * 1024,
     timeout: 30_000,
   });
-  const metadata = parsePlist(new Uint8Array(result.stdout));
+  const parsedInfo = parseIpaInfoPlist(result.stdout);
+  const metadata = parsedInfo.value;
   const bundleIdentifier = String(metadata?.CFBundleIdentifier || "").trim();
   const bundleVersion = String(metadata?.CFBundleVersion || metadata?.CFBundleShortVersionString || "").trim();
   const title = String(metadata?.CFBundleDisplayName || metadata?.CFBundleName || "iOS App").trim();
@@ -379,6 +380,7 @@ function friendlySigningError(error) {
   if (error?.code === "INVALID_PROVISIONING_PROFILE_PLIST") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_PLIST). Worker đã thử XML, Binary plist, Base64 plist và lớp DER OCTET STRING hợp lệ; kiểm tra Runtime Logs theo mã yêu cầu để biết định dạng payload thực tế.`;
   if (error?.code === "INCOMPLETE_PROVISIONING_PROFILE") return `${raw} (Mã: INCOMPLETE_PROVISIONING_PROFILE). Profile thiếu trường bắt buộc; hãy tải lại từ Apple Developer.`;
   if (error?.code === "INVALID_PROVISIONING_PROFILE_SIZE") return raw;
+  if (error?.code === "INVALID_IPA_INFO_PLIST") return `${raw} (Mã: INVALID_IPA_INFO_PLIST). Worker không đọc được Payload/*.app/Info.plist sau khi ký; hỗ trợ XML, Binary plist và OpenStep. Hãy kiểm tra IPA đầu vào hoặc cấu trúc IPA đầu ra.`;
   if (error?.code === "INVALID_PKCS12") return raw;
   if (error?.code === "PKCS12_TIMEOUT") return "Quá thời gian đọc P12/PFX. Hãy thử lại hoặc kiểm tra tệp chứng chỉ.";
   if (error?.code === "ENOENT") return "Signing worker thiếu chương trình unzip, OpenSSL hoặc ZSign. Hãy liên hệ quản trị viên.";
