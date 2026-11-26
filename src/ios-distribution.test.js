@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   assertProvisioningProfileUsable,
   assertTargetDeviceAllowed,
+  assertBundleIdentifierAllowed,
   buildItmsServicesUrl,
   buildOtaManifestXml,
   classifyProvisioningProfile,
@@ -47,8 +48,34 @@ test("rejects expired or unidentified provisioning profiles", () => {
 test("matches exact and wildcard App IDs", () => {
   assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.app", "com.example.app"), true);
   assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.*", "com.example.demo"), true);
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.*", "com.example.demo.extension"), true);
   assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.*", "com.other.demo"), false);
   assert.equal(isBundleIdentifierAllowed("ABCDE12345.*", "com.example.app"), true);
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.app", "com.example.other"), false);
+});
+
+test("uses App ID Prefix from application-identifier, not an assumed Team ID", () => {
+  // Historical App ID prefixes may differ from the current Team ID.
+  assert.equal(isBundleIdentifierAllowed("OLDPREFIX99.com.example.legacy", "com.example.legacy"), true);
+});
+
+test("validates wildcard shape and rejects malformed Bundle IDs", () => {
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.*", "com.example"), false);
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.*", "com.example."), false);
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.*.app", "com.example.app"), false);
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.*.child", "com.example.demo"), false);
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.app", "com..example.app"), false);
+  assert.equal(isBundleIdentifierAllowed("ABCDE12345.com.example.app", "com.example.app/other"), false);
+});
+
+test("returns actionable mismatch diagnostics without accepting an incompatible App ID", () => {
+  assert.equal(assertBundleIdentifierAllowed("ABCDE12345.com.example.app", "com.example.app"), true);
+  assert.throws(
+    () => assertBundleIdentifierAllowed("ABCDE12345.com.example.app", "com.other.app"),
+    (error) => error.code === "BUNDLE_ID_PROFILE_MISMATCH" &&
+      error.details.bundleIdentifier === "com.other.app" &&
+      error.details.applicationIdentifier === "ABCDE12345.com.example.app",
+  );
 });
 
 
@@ -73,6 +100,15 @@ test("classifies every standard iOS profile type for signing", () => {
   assert.equal(classifyProvisioningProfile({ ProvisionedDevices: [udidA], Entitlements: { "get-task-allow": true }, ExpirationDate: future }).type, "development");
   assert.equal(classifyProvisioningProfile({ Entitlements: { "get-task-allow": false }, ExpirationDate: future }).type, "app-store");
   assert.equal(classifyProvisioningProfile({ Entitlements: {}, ExpirationDate: future }).type, "other");
+});
+
+test("reads the macOS/Catalyst application-identifier entitlement fallback", () => {
+  const info = classifyProvisioningProfile({
+    ExpirationDate: future,
+    Entitlements: { "com.apple.application-identifier": "LEGACYPREFIX.com.example.catalyst" },
+  });
+  assert.equal(info.applicationIdentifier, "LEGACYPREFIX.com.example.catalyst");
+  assert.equal(isBundleIdentifierAllowed(info.applicationIdentifier, "com.example.catalyst"), true);
 });
 
 test("allows valid non-Ad Hoc profiles to pass profile eligibility checks", () => {

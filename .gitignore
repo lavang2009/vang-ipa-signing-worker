@@ -9,10 +9,9 @@ npm-debug.log*
 *.ipa
 *.zip
 .DS_Store
-
-# Added by safe GitHub upload script
 *.key
 *.pem
+*.p8
 service-account*.json
 firebase-admin*.json
 secrets*.json

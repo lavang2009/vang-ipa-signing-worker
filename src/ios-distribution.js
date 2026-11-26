@@ -29,8 +29,8 @@ export function classifyProvisioningProfile(profile) {
     expiresAt: expirationDate && Number.isFinite(expirationDate.getTime())
       ? expirationDate.toISOString()
       : null,
-    applicationIdentifier: typeof profile?.Entitlements?.["application-identifier"] === "string"
-      ? profile.Entitlements["application-identifier"]
+    applicationIdentifier: typeof (profile?.Entitlements?.["application-identifier"] || profile?.Entitlements?.["com.apple.application-identifier"]) === "string"
+      ? (profile.Entitlements["application-identifier"] || profile.Entitlements["com.apple.application-identifier"])
       : "",
   };
 }
@@ -81,19 +81,55 @@ export function assertTargetDeviceAllowed(profileInfo, targetUdid) {
   return { provided: true, registered: null };
 }
 
+const BUNDLE_IDENTIFIER_PATTERN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+
+/**
+ * Match the bundle identifier against the App ID in a provisioning profile.
+ * Apple defines application-identifier as <App ID Prefix>.<Bundle ID>.
+ * The prefix is NOT always the Team ID, so deliberately compare only the
+ * profile's suffix after its first dot. Wildcards are supported only as the
+ * complete App ID (`*`) or as the final component (`com.example.*`).
+ */
 export function isBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier) {
   if (typeof applicationIdentifier !== "string" || !applicationIdentifier.trim()) return false;
   if (typeof bundleIdentifier !== "string" || !bundleIdentifier.trim()) return false;
 
-  // Apple application-identifier is normally TEAMID.bundle.identifier.
-  const separator = applicationIdentifier.indexOf(".");
-  if (separator < 1 || separator === applicationIdentifier.length - 1) return false;
-  const profilePattern = applicationIdentifier.slice(separator + 1);
-  if (profilePattern === "*" || profilePattern === bundleIdentifier) return true;
-  if (profilePattern.endsWith(".*")) {
-    return bundleIdentifier.startsWith(profilePattern.slice(0, -1));
+  const appId = applicationIdentifier.trim();
+  const bundleId = bundleIdentifier.trim();
+  if (!BUNDLE_IDENTIFIER_PATTERN.test(bundleId)) return false;
+
+  const separator = appId.indexOf(".");
+  if (separator < 1 || separator === appId.length - 1) return false;
+
+  const appIdPrefix = appId.slice(0, separator);
+  const profilePattern = appId.slice(separator + 1);
+  if (!appIdPrefix || appIdPrefix.includes("*") || !profilePattern) return false;
+
+  if (profilePattern === "*") return true;
+  if (profilePattern === bundleId) return true;
+
+  // Apple wildcard App IDs must have a single trailing wildcard. Require at
+  // least one complete bundle-ID component after the fixed prefix.
+  if (profilePattern.endsWith(".*") && !profilePattern.slice(0, -1).includes("*")) {
+    const fixedPrefix = profilePattern.slice(0, -1); // includes final dot
+    return bundleId.startsWith(fixedPrefix) && bundleId.length > fixedPrefix.length;
   }
   return false;
+}
+
+/** Fail early, before consuming quota or invoking ZSign, with safe diagnostics. */
+export function assertBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier) {
+  if (isBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier)) return true;
+
+  const error = new Error(
+    `Bundle ID không khớp Provisioning Profile. Bundle ID được chọn: "${String(bundleIdentifier || "(trống)")}"; application-identifier của profile: "${String(applicationIdentifier || "(thiếu)")}". Hãy dùng IPA/Bundle ID thuộc đúng App ID hoặc tải profile tương ứng từ Apple Developer.`,
+  );
+  error.code = "BUNDLE_ID_PROFILE_MISMATCH";
+  error.details = {
+    bundleIdentifier: typeof bundleIdentifier === "string" ? bundleIdentifier : null,
+    applicationIdentifier: typeof applicationIdentifier === "string" ? applicationIdentifier : null,
+  };
+  throw error;
 }
 
 function escapeXml(value) {

@@ -21,11 +21,11 @@ import { isIpaSigningMaintenanceBlocked, normalizeIpaSigningMaintenance } from "
 import {
   assertProvisioningProfileUsable,
   assertTargetDeviceAllowed,
+  assertBundleIdentifierAllowed,
   buildItmsServicesUrl,
   buildOtaManifestXml,
   classifyProvisioningProfile,
   isSupportedUdid,
-  isBundleIdentifierAllowed,
 } from "./ios-distribution.js";
 import { del, get, issueSignedToken, presignUrl, put } from "@vercel/blob";
 
@@ -39,7 +39,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-signing-info-plist-format-fix-2026-11-26";
+const workerBuild = "ipa-signing-bundle-id-profile-match-fix-2026-11-26";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -292,6 +292,16 @@ async function readIpaAppMetadata(ipaPath) {
   return { bundleIdentifier, bundleVersion, title };
 }
 
+function assertSignedBundleIdentifier(expectedBundleIdentifier, actualBundleIdentifier) {
+  if (actualBundleIdentifier === expectedBundleIdentifier) return;
+  const error = new Error(
+    `Bundle ID sau khi ZSign xử lý là "${actualBundleIdentifier || "(không đọc được)"}", nhưng Bundle ID được chọn trước khi ký là "${expectedBundleIdentifier}". Kết quả đã bị hủy; hãy kiểm tra IPA đầu vào và tùy chọn đổi Bundle ID.`,
+  );
+  error.code = "BUNDLE_ID_NOT_APPLIED";
+  error.details = { expectedBundleIdentifier, actualBundleIdentifier: actualBundleIdentifier || null };
+  throw error;
+}
+
 async function ensureZipMagic(filePath, label) {
   const handle = await fs.open(filePath, "r");
   try {
@@ -381,6 +391,8 @@ function friendlySigningError(error) {
   if (error?.code === "INCOMPLETE_PROVISIONING_PROFILE") return `${raw} (Mã: INCOMPLETE_PROVISIONING_PROFILE). Profile thiếu trường bắt buộc; hãy tải lại từ Apple Developer.`;
   if (error?.code === "INVALID_PROVISIONING_PROFILE_SIZE") return raw;
   if (error?.code === "INVALID_IPA_INFO_PLIST") return `${raw} (Mã: INVALID_IPA_INFO_PLIST). Worker không đọc được Payload/*.app/Info.plist sau khi ký; hỗ trợ XML, Binary plist và OpenStep. Hãy kiểm tra IPA đầu vào hoặc cấu trúc IPA đầu ra.`;
+  if (error?.code === "BUNDLE_ID_PROFILE_MISMATCH") return raw;
+  if (error?.code === "BUNDLE_ID_NOT_APPLIED") return `${raw} (Mã: BUNDLE_ID_NOT_APPLIED). ZSign không tạo ra Bundle ID đúng như yêu cầu; Worker đã hủy kết quả để tránh trả về IPA không tương thích profile.`;
   if (error?.code === "INVALID_PKCS12") return raw;
   if (error?.code === "PKCS12_TIMEOUT") return "Quá thời gian đọc P12/PFX. Hãy thử lại hoặc kiểm tra tệp chứng chỉ.";
   if (error?.code === "ENOENT") return "Signing worker thiếu chương trình unzip, OpenSSL hoặc ZSign. Hãy liên hệ quản trị viên.";
@@ -415,10 +427,15 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     }
 
     await assertIpaStructure(ipa.path);
+    const sourceMetadata = await readIpaAppMetadata(ipa.path);
     const signingP12Path = await preparePkcs12ForSigning(p12.path, req.workDir, p12Password);
     const rawProvisioningProfile = await decodeProvisioningProfile(profile.path);
     const provisioningProfileInfo = assertProvisioningProfileUsable(classifyProvisioningProfile(rawProvisioningProfile));
     const targetDeviceCheck = assertTargetDeviceAllowed(provisioningProfileInfo, targetUdid);
+    const expectedBundleIdentifier = bundleId || sourceMetadata.bundleIdentifier;
+    // Validate the selected IPA/Bundle ID against the profile before quota is
+    // consumed and before ZSign is invoked. Do not silently rewrite a fixed App ID.
+    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, expectedBundleIdentifier);
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
     const args = ["-f", "-k", signingP12Path];
@@ -439,6 +456,9 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     const stat = await fs.stat(outputPath);
     if (!stat.isFile() || stat.size < 4) throw new Error("ZSign không tạo được tệp IPA đầu ra.");
     await assertIpaStructure(outputPath);
+    const signedMetadata = await readIpaAppMetadata(outputPath);
+    assertSignedBundleIdentifier(expectedBundleIdentifier, signedMetadata.bundleIdentifier);
+    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, signedMetadata.bundleIdentifier);
     const outputName = safeInputName(path.basename(ipa.originalname, path.extname(ipa.originalname)) + "-signed", "vang-store-signed", ".ipa");
     auditCode = "OK";
     await writeAudit(req.user.uid, "success", {
@@ -462,7 +482,10 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
       appNameChanged: Boolean(String(req.body.appName || "").trim()),
       durationMs: Date.now() - startedAt, errorCode: auditCode, requestId: req.requestId,
     });
-    res.status(error?.message?.startsWith("Bạn đã đạt giới hạn") ? 429 : 400).json({ error: message, code: auditCode, requestId: req.requestId });
+    res.status(error?.message?.startsWith("Bạn đã đạt giới hạn") ? 429 : 400).json({
+      error: message, code: auditCode, requestId: req.requestId,
+      ...(error?.details ? { details: error.details } : {}),
+    });
     await fs.rm(req.workDir, { recursive: true, force: true }).catch(() => {});
   }
 });
@@ -566,7 +589,13 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       classifyProvisioningProfile(rawProvisioningProfile),
     );
     const targetDeviceCheck = assertTargetDeviceAllowed(provisioningProfileInfo, targetUdid);
-    // Consume quota only after the IPA, P12/PFX, provisioning profile and optional device check pass.
+    const sourceMetadata = await readIpaAppMetadata(ipaPath);
+    const expectedBundleIdentifier = bundleId || sourceMetadata.bundleIdentifier;
+    // Validate against the profile before consuming quota or running ZSign.
+    // App ID Prefix may be a legacy prefix, not necessarily the Team ID.
+    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, expectedBundleIdentifier);
+    // Consume quota only after the IPA, P12/PFX, provisioning profile, Bundle ID
+    // and optional device check have all passed preflight validation.
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
     const args = ["-f", "-k", signingP12Path];
@@ -590,9 +619,8 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     await assertIpaStructure(outputPath);
 
     const appMetadata = await readIpaAppMetadata(outputPath);
-    if (!isBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, appMetadata.bundleIdentifier)) {
-      throw new Error("Bundle ID trong IPA đã ký không khớp application-identifier của Provisioning Profile.");
-    }
+    assertSignedBundleIdentifier(expectedBundleIdentifier, appMetadata.bundleIdentifier);
+    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, appMetadata.bundleIdentifier);
 
     const sourceLabel = typeof body.originalName === "string" ? body.originalName : "vang-store";
     const outputName = safeInputName(path.basename(sourceLabel, path.extname(sourceLabel)) + "-signed", "vang-store-signed", ".ipa");
@@ -650,6 +678,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       profileType: provisioningProfileInfo.type,
       registeredDeviceCount: provisioningProfileInfo.registeredDeviceCount,
       profileExpiresAt: provisioningProfileInfo.expiresAt,
+      applicationIdentifier: provisioningProfileInfo.applicationIdentifier,
       bundleIdentifier: appMetadata.bundleIdentifier,
       appVersion: appMetadata.bundleVersion,
       requiresRegisteredDevice: provisioningProfileInfo.type === "ad-hoc" || provisioningProfileInfo.type === "development",
@@ -690,7 +719,10 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       : message.startsWith("Bạn đã đạt giới hạn") ? 429
       : error?.code === "BLOB_NOT_FOUND" ? 404
       : 400;
-    return res.status(status).json({ error: message, code: auditCode, requestId: req.requestId });
+    return res.status(status).json({
+      error: message, code: auditCode, requestId: req.requestId,
+      ...(error?.details ? { details: error.details } : {}),
+    });
   } finally {
     const toDelete = [...ipaPaths, ...p12Paths, ...profilePaths];
     if (toDelete.length && blobReady) await del(toDelete).catch((error) => console.error("Could not delete private input chunks:", error instanceof Error ? error.message : "unknown"));
