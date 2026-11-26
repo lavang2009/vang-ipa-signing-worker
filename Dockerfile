@@ -1,7 +1,7 @@
 # Build ZSign on the same Debian 12 base as the runtime image.
 # This prevents Ubuntu 24.04 binaries (GLIBC_2.38 / newer GLIBCXX symbols)
 # from being copied into Debian 12, which ships older runtime libraries.
-FROM node:22-bookworm-slim AS zsign-builder
+FROM node:24-bookworm-slim AS zsign-builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git g++ make pkg-config libssl-dev \
@@ -12,7 +12,7 @@ RUN git clone --depth 1 --branch ${ZSIGN_REF} https://github.com/zhlynn/zsign.gi
     && make clean && make \
     && test -x /src/zsign/bin/zsign
 
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 # Do not set TMPDIR to a non-existent path before apt installs ca-certificates:
 # its post-install script uses mktemp and fails when TMPDIR does not exist.
 ENV NODE_ENV=production PORT=8080 DEBIAN_FRONTEND=noninteractive

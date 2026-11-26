@@ -50,7 +50,7 @@ Health check sẵn sàng chỉ khi có:
   "signBlob": true,
   "corsConfigured": true,
   "firebaseProjectId": "your-firebase-project-id",
-  "build": "ipa-signing-pkcs12-reader-fix-2026-11-19",
+  "build": "ipa-signing-profile-plist-payload-fix-2026-11-26",
   "zsignVersion": "..."
 }
 ```
@@ -97,7 +97,7 @@ Docker build sử dụng Debian Bookworm cho cả Builder và Runtime để trá
 
 ## Multi-profile signing and OTA manifest update (2026-11-16)
 
-The worker now requires the `openssl` CLI and the `plist` Node package to inspect the CMS-wrapped `.mobileprovision` and the IPA `Info.plist`. The Docker runtime installs OpenSSL. `GET /healthz` reports `openssl` and `provisioningProfileInspector`.
+The worker now requires the `openssl` CLI and the `plist` Node package to inspect the CMS-wrapped `.mobileprovision` and the IPA `Info.plist`. The Docker runtime installs OpenSSL. `GET /healthz` reports `openssl` and `provisioningProfileInspector`. Use Node.js 24.12.0 or newer; the current Firebase database dependency declares that minimum runtime.
 
 The signing endpoint accepts valid Apple iOS provisioning profiles across the common categories: Ad Hoc, In-House/Enterprise, Development, and App Store, plus structurally valid variants that ZSign may support. A profile must still pass CMS verification, required-field validation, expiry checks, App ID compatibility, and final ZSign certificate/profile compatibility.
 
@@ -117,3 +117,10 @@ If decoding fails, Runtime Logs include the OpenSSL strategy, exit code and a sh
 Test locally with `npm test`; the CMS decoder tests generate a temporary synthetic profile signed by a disposable test certificate and never use production credentials.
 
 Expected Worker health build: `ipa-signing-pkcs12-reader-fix-2026-11-19`.
+
+
+## Provisioning profile plist payload compatibility (2026-11-26)
+
+After CMS verification, the Worker now recognizes XML plist, binary plist, UTF-8 BOM-prefixed XML, Base64-encoded plist, and a complete DER OCTET STRING wrapper. If an inner CMS SignedData payload is encountered, the Worker verifies that inner CMS before parsing its content. Runtime diagnostics report only payload format and byte count. If the payload still cannot be parsed, compare the `requestId` from the browser with Worker Runtime Logs; no profile contents, certificate values, UDIDs, or secrets are logged.
+
+The `plist` dependency is constrained to `^5.1.1`, and the Docker builder/runtime use Node 24.12+ to match the Firebase database dependency engine requirement. Run `npm ci` and `npm test` after deploying with Node 24.12 or newer.

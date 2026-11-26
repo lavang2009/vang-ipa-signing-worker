@@ -39,7 +39,7 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-signing-pkcs12-reader-fix-2026-11-19";
+const workerBuild = "ipa-signing-profile-plist-payload-fix-2026-11-26";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -376,7 +376,7 @@ function friendlySigningError(error) {
   if (error?.code === "INVALID_PROVISIONING_PROFILE_CMS") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_CMS). Worker đã thử CMS DER, PEM và S/MIME; xem Runtime Logs để biết lỗi OpenSSL cụ thể.`;
   if (error?.code === "INVALID_DER_ENCODED_PROFILE") return `${raw} (Mã: INVALID_DER_ENCODED_PROFILE). Phần DER-Encoded-Profile của profile không hợp lệ hoặc không xác minh được.`;
   if (error?.code === "UNSIGNED_PROVISIONING_PROFILE") return `${raw} (Mã: UNSIGNED_PROVISIONING_PROFILE). Worker chỉ chấp nhận profile CMS gốc đã được Apple ký.`;
-  if (error?.code === "INVALID_PROVISIONING_PROFILE_PLIST") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_PLIST). CMS hợp lệ nhưng payload bên trong không phải plist mà Worker đọc được.`;
+  if (error?.code === "INVALID_PROVISIONING_PROFILE_PLIST") return `${raw} (Mã: INVALID_PROVISIONING_PROFILE_PLIST). Worker đã thử XML, Binary plist, Base64 plist và lớp DER OCTET STRING hợp lệ; kiểm tra Runtime Logs theo mã yêu cầu để biết định dạng payload thực tế.`;
   if (error?.code === "INCOMPLETE_PROVISIONING_PROFILE") return `${raw} (Mã: INCOMPLETE_PROVISIONING_PROFILE). Profile thiếu trường bắt buộc; hãy tải lại từ Apple Developer.`;
   if (error?.code === "INVALID_PROVISIONING_PROFILE_SIZE") return raw;
   if (error?.code === "INVALID_PKCS12") return raw;

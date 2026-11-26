@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { buildBinary } from "plist";
 import { decodeProvisioningProfile } from "./provisioning-profile.js";
 
 const hasOpenSsl = (() => {
@@ -38,7 +39,35 @@ async function makeFixture(t) {
     "cms", "-sign", "-binary", "-in", plistPath, "-signer", certPath, "-inkey", keyPath,
     "-outform", "DER", "-out", profilePath, "-nodetach",
   ], { stdio: "ignore" });
-  return { dir, profilePath };
+  return { dir, profilePath, keyPath, certPath };
+}
+
+async function signPayload(dir, payload, keyPath, certPath, name = "custom") {
+  const payloadPath = path.join(dir, `${name}.payload`);
+  const profilePath = path.join(dir, `${name}.mobileprovision`);
+  await fs.writeFile(payloadPath, payload);
+  execFileSync("openssl", [
+    "cms", "-sign", "-binary", "-in", payloadPath, "-signer", certPath, "-inkey", keyPath,
+    "-outform", "DER", "-out", profilePath, "-nodetach",
+  ], { stdio: "ignore" });
+  return profilePath;
+}
+
+function derOctetString(payload) {
+  const data = Buffer.from(payload);
+  let length;
+  if (data.length < 0x80) {
+    length = Buffer.from([data.length]);
+  } else {
+    const bytes = [];
+    let remaining = data.length;
+    while (remaining > 0) {
+      bytes.unshift(remaining & 0xff);
+      remaining = Math.floor(remaining / 256);
+    }
+    length = Buffer.from([0x80 | bytes.length, ...bytes]);
+  }
+  return Buffer.concat([Buffer.from([0x04]), length, data]);
 }
 
 test("decodes a valid CMS-signed provisioning profile using OpenSSL", { skip: !hasOpenSsl }, async (t) => {
@@ -118,4 +147,45 @@ test("rejects a plain plist file because it has no Apple CMS wrapper", async (t)
     assert.match(error.message, /plist thô/);
     return true;
   });
+});
+
+
+test("decodes a CMS payload wrapped in a complete DER OCTET STRING", { skip: !hasOpenSsl }, async (t) => {
+  const { dir, keyPath, certPath } = await makeFixture(t);
+  const profilePath = await signPayload(dir, derOctetString(Buffer.from(samplePlist)), keyPath, certPath, "octet-wrapped");
+  const profile = await decodeProvisioningProfile(profilePath);
+  assert.equal(profile.Name, "Fixture Ad Hoc");
+});
+
+test("decodes a Base64-encoded XML plist CMS payload", { skip: !hasOpenSsl }, async (t) => {
+  const { dir, keyPath, certPath } = await makeFixture(t);
+  const base64Payload = Buffer.from(samplePlist).toString("base64");
+  const profilePath = await signPayload(dir, Buffer.from(base64Payload), keyPath, certPath, "base64-plist");
+  const profile = await decodeProvisioningProfile(profilePath);
+  assert.equal(profile.Name, "Fixture Ad Hoc");
+});
+
+test("decodes a CMS-signed binary plist payload", { skip: !hasOpenSsl }, async (t) => {
+  const { dir, keyPath, certPath } = await makeFixture(t);
+  const object = {
+    Name: "Binary Fixture",
+    UUID: "00000000-0000-0000-0000-000000000002",
+    ExpirationDate: new Date("2030-01-01T00:00:00Z"),
+    Entitlements: { "get-task-allow": false, "application-identifier": "ABCDE12345.com.example.binary" },
+    DeveloperCertificates: [Buffer.from([0x01, 0x02, 0x03])],
+    ProvisionedDevices: ["0123456789ABCDEF0123456789ABCDEF01234567"],
+  };
+  const profilePath = await signPayload(dir, Buffer.from(buildBinary(object)), keyPath, certPath, "binary-plist");
+  const profile = await decodeProvisioningProfile(profilePath);
+  assert.equal(profile.Name, "Binary Fixture");
+  assert.equal(profile.Entitlements["application-identifier"], "ABCDE12345.com.example.binary");
+});
+
+test("verifies an inner CMS payload before parsing its plist", { skip: !hasOpenSsl }, async (t) => {
+  const { dir, keyPath, certPath } = await makeFixture(t);
+  const innerPath = await signPayload(dir, Buffer.from(samplePlist), keyPath, certPath, "inner");
+  const innerCms = await fs.readFile(innerPath);
+  const outerPath = await signPayload(dir, innerCms, keyPath, certPath, "outer-inner-cms");
+  const profile = await decodeProvisioningProfile(outerPath);
+  assert.equal(profile.Name, "Fixture Ad Hoc");
 });
