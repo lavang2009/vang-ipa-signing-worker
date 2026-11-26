@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import crypto from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
@@ -87,3 +88,71 @@ export async function preparePkcs12ForSigning(inputPath, workDir, password) {
     await fs.rm(extractedPath, { force: true }).catch(() => {});
   }
 }
+
+/** Extract only public certificates from PKCS#12 and return SHA-256 DER
+ * fingerprints. The private key is never written to stdout or returned. */
+export async function getPkcs12CertificateFingerprints(p12Path, password = "") {
+  const passphrase = String(password || "");
+  if (passphrase.includes("\0")) throw invalidPkcs12(new Error("Unsupported password encoding."));
+
+  const pem = await new Promise((resolve, reject) => {
+    const child = spawn("openssl", [
+      "pkcs12", "-in", p12Path, "-clcerts", "-nokeys", "-passin", "fd:0",
+    ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    const stdout = [];
+    let stdoutBytes = 0;
+    let stderr = "";
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(reject, Object.assign(new Error("OpenSSL PKCS#12 certificate inspection timed out."), { code: "PKCS12_TIMEOUT" }));
+    }, OPENSSL_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > 2 * 1024 * 1024) {
+        child.kill("SIGKILL");
+        finish(reject, invalidPkcs12(new Error("PKCS#12 certificate output exceeded the inspection limit.")));
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 4_000) stderr += chunk.toString();
+    });
+    child.on("error", (error) => finish(reject, error));
+    child.on("close", (code) => {
+      if (code !== 0) {
+        finish(reject, invalidPkcs12(new Error(stderr || `OpenSSL exited with code ${code}.`)));
+        return;
+      }
+      finish(resolve, Buffer.concat(stdout).toString("utf8"));
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end(Buffer.from(`${passphrase}\n`, "utf8"));
+  });
+
+  const blocks = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) || [];
+  const fingerprints = [];
+  for (const block of blocks) {
+    try {
+      const certificate = new crypto.X509Certificate(block);
+      fingerprints.push(crypto.createHash("sha256").update(certificate.raw).digest("hex"));
+    } catch {
+      // Ignore non-certificate blocks; only usable X.509 DER certs are compared.
+    }
+  }
+  if (!fingerprints.length) {
+    const error = new Error("P12/PFX không chứa chứng chỉ X.509 công khai có thể đọc được.");
+    error.code = "SIGNING_CERTIFICATE_EXTRACTION_FAILED";
+    throw error;
+  }
+  return [...new Set(fingerprints)];
+}
+

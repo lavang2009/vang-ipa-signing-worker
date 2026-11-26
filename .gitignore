@@ -9,9 +9,3 @@ npm-debug.log*
 *.ipa
 *.zip
 .DS_Store
-*.key
-*.pem
-*.p8
-service-account*.json
-firebase-admin*.json
-secrets*.json

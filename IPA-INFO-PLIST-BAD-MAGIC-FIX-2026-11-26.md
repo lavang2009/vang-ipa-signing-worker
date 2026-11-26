@@ -22,4 +22,4 @@ The `/v1/sign-blob` endpoint signs the IPA and then reads `Payload/*.app/Info.pl
 
 ## Build identifier
 
-`ipa-signing-info-plist-format-fix-2026-11-26`
+`ipa-signing-preserve-original-bundle-id-zsign-preflight-2026-11-26` is the current build; the Info.plist parser fix remains included.

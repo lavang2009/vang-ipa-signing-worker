@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 
 export function classifyProvisioningProfile(profile) {
   const provisionedDevices = Array.isArray(profile?.ProvisionedDevices)
@@ -22,6 +23,11 @@ export function classifyProvisioningProfile(profile) {
       ? new Date(rawExpiration)
       : null;
 
+  const applicationIdentifier = typeof (profile?.Entitlements?.["application-identifier"] || profile?.Entitlements?.["com.apple.application-identifier"]) === "string"
+    ? (profile.Entitlements["application-identifier"] || profile.Entitlements["com.apple.application-identifier"])
+    : "";
+  const appIdSeparator = applicationIdentifier.indexOf(".");
+
   return {
     type,
     registeredDeviceCount: provisionedDevices.length,
@@ -29,9 +35,14 @@ export function classifyProvisioningProfile(profile) {
     expiresAt: expirationDate && Number.isFinite(expirationDate.getTime())
       ? expirationDate.toISOString()
       : null,
-    applicationIdentifier: typeof (profile?.Entitlements?.["application-identifier"] || profile?.Entitlements?.["com.apple.application-identifier"]) === "string"
-      ? (profile.Entitlements["application-identifier"] || profile.Entitlements["com.apple.application-identifier"])
-      : "",
+    applicationIdentifier,
+    appIdPrefix: appIdSeparator > 0 ? applicationIdentifier.slice(0, appIdSeparator) : "",
+    profileBundlePattern: appIdSeparator > 0 ? applicationIdentifier.slice(appIdSeparator + 1) : "",
+    profileName: typeof profile?.Name === "string" ? profile.Name : "",
+    profileUuid: typeof profile?.UUID === "string" ? profile.UUID : "",
+    teamIdentifiers: Array.isArray(profile?.TeamIdentifier)
+      ? profile.TeamIdentifier.filter((item) => typeof item === "string" && item.trim())
+      : [],
   };
 }
 
@@ -118,18 +129,102 @@ export function isBundleIdentifierAllowed(applicationIdentifier, bundleIdentifie
 }
 
 /** Fail early, before consuming quota or invoking ZSign, with safe diagnostics. */
-export function assertBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier) {
+export function getApplicationIdentifierParts(applicationIdentifier) {
+  if (typeof applicationIdentifier !== "string") return null;
+  const value = applicationIdentifier.trim();
+  const separator = value.indexOf(".");
+  if (separator < 1 || separator === value.length - 1) return null;
+  const appIdPrefix = value.slice(0, separator);
+  const profileBundlePattern = value.slice(separator + 1);
+  if (!/^[A-Za-z0-9-]+$/.test(appIdPrefix) || !profileBundlePattern) return null;
+  return { appIdPrefix, profileBundlePattern };
+}
+
+/** Preserve the IPA's embedded CFBundleIdentifier. This signing workflow must
+ * never silently rewrite it to make an unrelated profile appear compatible. */
+export function assertOriginalBundleIdentifier(sourceBundleIdentifier, requestedBundleIdentifier = "") {
+  const source = typeof sourceBundleIdentifier === "string" ? sourceBundleIdentifier.trim() : "";
+  const requested = typeof requestedBundleIdentifier === "string" ? requestedBundleIdentifier.trim() : "";
+  if (!source || !BUNDLE_IDENTIFIER_PATTERN.test(source)) {
+    const error = new Error("Không đọc được Bundle ID gốc hợp lệ từ IPA.");
+    error.code = "INVALID_SOURCE_BUNDLE_ID";
+    throw error;
+  }
+  if (requested && requested !== source) {
+    const error = new Error(
+      `VANG STORE đang giữ nguyên Bundle ID gốc của IPA (${source}) và không cho phép đổi sang ${requested}. Hãy dùng IPA có Bundle ID đúng hoặc tải Provisioning Profile tương ứng với Bundle ID gốc.`,
+    );
+    error.code = "BUNDLE_ID_OVERRIDE_DISABLED";
+    error.details = {
+      sourceBundleIdentifier: source,
+      requestedBundleIdentifier: requested,
+      policy: "PRESERVE_SOURCE_BUNDLE_ID",
+    };
+    throw error;
+  }
+  return source;
+}
+
+export function assertBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier, profileInfo = {}) {
   if (isBundleIdentifierAllowed(applicationIdentifier, bundleIdentifier)) return true;
 
+  const parts = getApplicationIdentifierParts(applicationIdentifier);
+  const bundlePattern = parts?.profileBundlePattern || "(không đọc được)";
+  const prefix = parts?.appIdPrefix || "(không đọc được)";
   const error = new Error(
-    `Bundle ID không khớp Provisioning Profile. Bundle ID được chọn: "${String(bundleIdentifier || "(trống)")}"; application-identifier của profile: "${String(applicationIdentifier || "(thiếu)")}". Hãy dùng IPA/Bundle ID thuộc đúng App ID hoặc tải profile tương ứng từ Apple Developer.`,
+    `Provisioning Profile không cấp quyền cho Bundle ID gốc của IPA. IPA: "${String(bundleIdentifier || "(trống)")}"; App ID trong profile: "${String(applicationIdentifier || "(thiếu)")}". Hãy giữ nguyên Bundle ID và tải profile được tạo cho đúng App ID này từ Apple Developer. Worker không tự đổi Bundle ID hoặc bỏ qua entitlement.`,
   );
   error.code = "BUNDLE_ID_PROFILE_MISMATCH";
   error.details = {
     bundleIdentifier: typeof bundleIdentifier === "string" ? bundleIdentifier : null,
+    sourceBundleIdentifier: typeof bundleIdentifier === "string" ? bundleIdentifier : null,
     applicationIdentifier: typeof applicationIdentifier === "string" ? applicationIdentifier : null,
+    appIdPrefix: parts?.appIdPrefix || null,
+    profileBundlePattern: parts?.profileBundlePattern || null,
+    profileName: profileInfo.profileName || null,
+    profileUuid: profileInfo.profileUuid || null,
+    teamIdentifiers: Array.isArray(profileInfo.teamIdentifiers) ? profileInfo.teamIdentifiers : [],
+    policy: "PRESERVE_SOURCE_BUNDLE_ID",
+    nextAction: "DOWNLOAD_MATCHING_PROVISIONING_PROFILE_FROM_APPLE_DEVELOPER",
   };
   throw error;
+}
+
+
+function toCertificateBytes(value) {
+  if (Buffer.isBuffer(value)) return value;
+  if (value instanceof Uint8Array) return Buffer.from(value);
+  return null;
+}
+
+/** Ensure the signing certificate's DER bytes are one of the certificates
+ * explicitly authorized by the Apple-signed profile. Fingerprints are SHA-256
+ * hex strings from X509 DER, never the private key. */
+export function assertSigningCertificateInProfile(profile, signingCertificateFingerprints = []) {
+  const allowedCertificates = Array.isArray(profile?.DeveloperCertificates)
+    ? profile.DeveloperCertificates.map(toCertificateBytes).filter(Boolean)
+    : [];
+  const allowedFingerprints = new Set(allowedCertificates.map((bytes) =>
+    crypto.createHash("sha256").update(bytes).digest("hex").toLowerCase(),
+  ));
+  const supplied = new Set(signingCertificateFingerprints
+    .filter((value) => typeof value === "string")
+    .map((value) => value.replace(/[^a-f0-9]/gi, "").toLowerCase())
+    .filter(Boolean));
+
+  if (!allowedFingerprints.size || !supplied.size || ![...supplied].some((value) => allowedFingerprints.has(value))) {
+    const error = new Error(
+      "Chứng chỉ trong P12/PFX không nằm trong DeveloperCertificates của Provisioning Profile. Hãy chọn đúng cặp P12 và profile được tạo cùng chứng chỉ trên Apple Developer.",
+    );
+    error.code = "SIGNING_CERTIFICATE_NOT_IN_PROFILE";
+    error.details = {
+      profileCertificateCount: allowedFingerprints.size,
+      providedCertificateCount: supplied.size,
+      matchingCertificate: false,
+    };
+    throw error;
+  }
+  return true;
 }
 
 function escapeXml(value) {

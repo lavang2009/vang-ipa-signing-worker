@@ -15,13 +15,15 @@ import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { parseIpaInfoPlist } from "./ipa-info-plist.js";
 import { decodeProvisioningProfile } from "./provisioning-profile.js";
-import { preparePkcs12ForSigning } from "./pkcs12.js";
+import { preparePkcs12ForSigning, getPkcs12CertificateFingerprints } from "./pkcs12.js";
 import { applyCors, buildAllowedOrigins } from "./cors.js";
 import { isIpaSigningMaintenanceBlocked, normalizeIpaSigningMaintenance } from "./maintenance.js";
 import {
   assertProvisioningProfileUsable,
   assertTargetDeviceAllowed,
   assertBundleIdentifierAllowed,
+  assertOriginalBundleIdentifier,
+  assertSigningCertificateInProfile,
   buildItmsServicesUrl,
   buildOtaManifestXml,
   classifyProvisioningProfile,
@@ -39,7 +41,8 @@ const dailyLimit = Number(process.env.SIGNING_DAILY_LIMIT || 10);
 const signingTimeout = Number(process.env.SIGNING_TIMEOUT_MS || 240_000);
 const zsignBin = process.env.ZSIGN_BIN || "/usr/local/bin/zsign";
 const blobReady = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-const workerBuild = "ipa-signing-bundle-id-profile-match-fix-2026-11-26";
+const workerBuild = "ipa-signing-preserve-original-bundle-id-zsign-preflight-2026-11-26";
+const zsignSource = "https://github.com/zhlynn/zsign";
 
 // Keep the CORS allow-list strict and independently unit-tested.
 const allowedOrigins = buildAllowedOrigins(process.env.ALLOWED_ORIGINS || "");
@@ -133,6 +136,10 @@ app.get("/healthz", (_req, res) => {
     service: "VANG STORE IPA Signing Worker",
     build: workerBuild,
     engine: zsignReady ? "zsign" : "unavailable",
+    zsignSource,
+    signingPolicy: "PRESERVE_SOURCE_BUNDLE_ID",
+    profileEntitlementPreflight: true,
+    signingCertificatePreflight: true,
     firebase: firebaseReady,
     firebaseProjectId,
     zsign: zsignReady,
@@ -295,7 +302,7 @@ async function readIpaAppMetadata(ipaPath) {
 function assertSignedBundleIdentifier(expectedBundleIdentifier, actualBundleIdentifier) {
   if (actualBundleIdentifier === expectedBundleIdentifier) return;
   const error = new Error(
-    `Bundle ID sau khi ZSign xử lý là "${actualBundleIdentifier || "(không đọc được)"}", nhưng Bundle ID được chọn trước khi ký là "${expectedBundleIdentifier}". Kết quả đã bị hủy; hãy kiểm tra IPA đầu vào và tùy chọn đổi Bundle ID.`,
+    `Bundle ID sau khi ZSign xử lý là "${actualBundleIdentifier || "(không đọc được)"}", nhưng Bundle ID được chọn trước khi ký là "${expectedBundleIdentifier}". Kết quả đã bị hủy; Worker chỉ cho phép giữ nguyên Bundle ID gốc của IPA.`,
   );
   error.code = "BUNDLE_ID_NOT_APPLIED";
   error.details = { expectedBundleIdentifier, actualBundleIdentifier: actualBundleIdentifier || null };
@@ -392,6 +399,9 @@ function friendlySigningError(error) {
   if (error?.code === "INVALID_PROVISIONING_PROFILE_SIZE") return raw;
   if (error?.code === "INVALID_IPA_INFO_PLIST") return `${raw} (Mã: INVALID_IPA_INFO_PLIST). Worker không đọc được Payload/*.app/Info.plist sau khi ký; hỗ trợ XML, Binary plist và OpenStep. Hãy kiểm tra IPA đầu vào hoặc cấu trúc IPA đầu ra.`;
   if (error?.code === "BUNDLE_ID_PROFILE_MISMATCH") return raw;
+  if (error?.code === "BUNDLE_ID_OVERRIDE_DISABLED") return raw;
+  if (error?.code === "SIGNING_CERTIFICATE_NOT_IN_PROFILE") return `${raw} (Mã: SIGNING_CERTIFICATE_NOT_IN_PROFILE). Chọn tệp P12/PFX có chứng chỉ được liệt kê trong DeveloperCertificates của đúng profile.`;
+  if (error?.code === "SIGNING_CERTIFICATE_EXTRACTION_FAILED") return `${raw} (Mã: SIGNING_CERTIFICATE_EXTRACTION_FAILED). Worker không đọc được chứng chỉ công khai từ P12/PFX.`;
   if (error?.code === "BUNDLE_ID_NOT_APPLIED") return `${raw} (Mã: BUNDLE_ID_NOT_APPLIED). ZSign không tạo ra Bundle ID đúng như yêu cầu; Worker đã hủy kết quả để tránh trả về IPA không tương thích profile.`;
   if (error?.code === "INVALID_PKCS12") return raw;
   if (error?.code === "PKCS12_TIMEOUT") return "Quá thời gian đọc P12/PFX. Hãy thử lại hoặc kiểm tra tệp chứng chỉ.";
@@ -432,16 +442,18 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     const rawProvisioningProfile = await decodeProvisioningProfile(profile.path);
     const provisioningProfileInfo = assertProvisioningProfileUsable(classifyProvisioningProfile(rawProvisioningProfile));
     const targetDeviceCheck = assertTargetDeviceAllowed(provisioningProfileInfo, targetUdid);
-    const expectedBundleIdentifier = bundleId || sourceMetadata.bundleIdentifier;
-    // Validate the selected IPA/Bundle ID against the profile before quota is
-    // consumed and before ZSign is invoked. Do not silently rewrite a fixed App ID.
-    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, expectedBundleIdentifier);
+    const expectedBundleIdentifier = assertOriginalBundleIdentifier(sourceMetadata.bundleIdentifier, bundleId);
+    // Preserve the original IPA Bundle ID. The Apple-signed profile must authorize
+    // this exact identifier; never rewrite the app just to fit an unrelated profile.
+    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, expectedBundleIdentifier, provisioningProfileInfo);
+    const signingCertificateFingerprints = await getPkcs12CertificateFingerprints(signingP12Path, p12Password);
+    assertSigningCertificateInProfile(rawProvisioningProfile, signingCertificateFingerprints);
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
     const args = ["-f", "-k", signingP12Path];
     if (p12Password) args.push("-p", p12Password);
     args.push("-m", profile.path);
-    if (bundleId) args.push("-b", bundleId);
+    // No -b option: preserve CFBundleIdentifier from the source IPA.
     if (appName) args.push("-n", appName);
     args.push("-o", outputPath, "-z", "6", ipa.path);
     try {
@@ -463,7 +475,7 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     auditCode = "OK";
     await writeAudit(req.user.uid, "success", {
       ipaSize: ipa.size, p12Size: p12.size, profileSize: profile.size,
-      bundleIdChanged: Boolean(bundleId), appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
+      bundleIdChanged: false, appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
       requestId: req.requestId,
     });
     res.setHeader("X-Signing-Engine", "ZSign");
@@ -478,7 +490,7 @@ app.post("/v1/sign", authenticate, enforceIpaSigningMaintenance, createWorkDir, 
     auditCode = error?.code || "VALIDATION_OR_SIGNING_ERROR";
     await writeAudit(req.user.uid, "failed", {
       ipaSize: ipa?.size, p12Size: p12?.size, profileSize: profile?.size,
-      bundleIdChanged: Boolean(String(req.body.bundleId || "").trim()),
+      bundleIdChanged: false,
       appNameChanged: Boolean(String(req.body.appName || "").trim()),
       durationMs: Date.now() - startedAt, errorCode: auditCode, requestId: req.requestId,
     });
@@ -590,18 +602,18 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     );
     const targetDeviceCheck = assertTargetDeviceAllowed(provisioningProfileInfo, targetUdid);
     const sourceMetadata = await readIpaAppMetadata(ipaPath);
-    const expectedBundleIdentifier = bundleId || sourceMetadata.bundleIdentifier;
-    // Validate against the profile before consuming quota or running ZSign.
-    // App ID Prefix may be a legacy prefix, not necessarily the Team ID.
-    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, expectedBundleIdentifier);
-    // Consume quota only after the IPA, P12/PFX, provisioning profile, Bundle ID
-    // and optional device check have all passed preflight validation.
+    const expectedBundleIdentifier = assertOriginalBundleIdentifier(sourceMetadata.bundleIdentifier, bundleId);
+    // Preserve the source app identity and validate both Apple profile entitlement
+    // and P12 certificate authorization before consuming quota or running ZSign.
+    assertBundleIdentifierAllowed(provisioningProfileInfo.applicationIdentifier, expectedBundleIdentifier, provisioningProfileInfo);
+    const signingCertificateFingerprints = await getPkcs12CertificateFingerprints(signingP12Path, p12Password);
+    assertSigningCertificateInProfile(rawProvisioningProfile, signingCertificateFingerprints);
     await consumeDailyQuota(req.user.uid);
     const outputPath = path.join(req.workDir, "signed-output.ipa");
     const args = ["-f", "-k", signingP12Path];
     if (p12Password) args.push("-p", p12Password);
     args.push("-m", profilePath);
-    if (bundleId) args.push("-b", bundleId);
+    // No -b option: preserve CFBundleIdentifier from the source IPA.
     if (appName) args.push("-n", appName);
     args.push("-o", outputPath, "-z", "6", ipaPath);
 
@@ -679,6 +691,10 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
       registeredDeviceCount: provisioningProfileInfo.registeredDeviceCount,
       profileExpiresAt: provisioningProfileInfo.expiresAt,
       applicationIdentifier: provisioningProfileInfo.applicationIdentifier,
+      appIdPrefix: provisioningProfileInfo.appIdPrefix || null,
+      profileBundlePattern: provisioningProfileInfo.profileBundlePattern || null,
+      profileName: provisioningProfileInfo.profileName || null,
+      profileUuid: provisioningProfileInfo.profileUuid || null,
       bundleIdentifier: appMetadata.bundleIdentifier,
       appVersion: appMetadata.bundleVersion,
       requiresRegisteredDevice: provisioningProfileInfo.type === "ad-hoc" || provisioningProfileInfo.type === "development",
@@ -689,7 +705,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
 
     auditCode = "OK";
     await writeAudit(req.user.uid, "success", {
-      ipaSize, p12Size, profileSize, bundleIdChanged: Boolean(bundleId),
+      ipaSize, p12Size, profileSize, bundleIdChanged: false,
       appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt,
       requestId: req.requestId,
       profileType: provisioningProfileInfo.type,
@@ -712,7 +728,7 @@ app.post("/v1/sign-blob", authenticate, enforceIpaSigningMaintenance, createWork
     }
     const message = friendlySigningError(error);
     await writeAudit(req.user.uid, "failed", {
-      ipaSize, p12Size, profileSize, bundleIdChanged: Boolean(bundleId),
+      ipaSize, p12Size, profileSize, bundleIdChanged: false,
       appNameChanged: Boolean(appName), durationMs: Date.now() - startedAt, errorCode: auditCode, requestId: req.requestId,
     });
     const status = error?.code === "SIGNING_TIMEOUT" ? 504

@@ -1,9 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import {
   assertProvisioningProfileUsable,
   assertTargetDeviceAllowed,
   assertBundleIdentifierAllowed,
+  assertOriginalBundleIdentifier,
+  assertSigningCertificateInProfile,
+  getApplicationIdentifierParts,
   buildItmsServicesUrl,
   buildOtaManifestXml,
   classifyProvisioningProfile,
@@ -28,11 +32,20 @@ function adhocProfile(overrides = {}) {
   };
 }
 
-test("classifies a registered-device profile as Ad Hoc", () => {
-  const info = classifyProvisioningProfile(adhocProfile());
+test("classifies a registered-device profile as Ad Hoc and exposes safe App ID diagnostics", () => {
+  const info = classifyProvisioningProfile(adhocProfile({
+    Name: "Test profile",
+    UUID: "PROFILE-UUID-1",
+    TeamIdentifier: ["TEAM123456"],
+  }));
   assert.equal(info.type, "ad-hoc");
   assert.equal(info.registeredDeviceCount, 2);
   assert.equal(info.expiresAt, future.toISOString());
+  assert.equal(info.appIdPrefix, "ABCDE12345");
+  assert.equal(info.profileBundlePattern, "com.example.app");
+  assert.equal(info.profileName, "Test profile");
+  assert.equal(info.profileUuid, "PROFILE-UUID-1");
+  assert.deepEqual(info.teamIdentifiers, ["TEAM123456"]);
 });
 
 test("classifies enterprise and development profiles", () => {
@@ -79,6 +92,74 @@ test("returns actionable mismatch diagnostics without accepting an incompatible 
 });
 
 
+
+test("rejects the reported IPA/profile pair while preserving the original Bundle ID", () => {
+  const sourceBundleId = "p3.xyz.yyyue.esign";
+  const profileApplicationIdentifier = "2FRGLDX9FA.com.Azor255588.Azor";
+  assert.equal(assertOriginalBundleIdentifier(sourceBundleId), sourceBundleId);
+  assert.throws(
+    () => assertBundleIdentifierAllowed(profileApplicationIdentifier, sourceBundleId, {
+      profileName: "Azor profile",
+      profileUuid: "reported-profile",
+      teamIdentifiers: ["2FRGLDX9FA"],
+    }),
+    (error) => error.code === "BUNDLE_ID_PROFILE_MISMATCH" &&
+      error.details.sourceBundleIdentifier === sourceBundleId &&
+      error.details.applicationIdentifier === profileApplicationIdentifier &&
+      error.details.profileBundlePattern === "com.Azor255588.Azor" &&
+      error.details.nextAction === "DOWNLOAD_MATCHING_PROVISIONING_PROFILE_FROM_APPLE_DEVELOPER",
+  );
+});
+
+test("extracts App ID prefix and wildcard pattern without confusing it with Team ID", () => {
+  assert.deepEqual(getApplicationIdentifierParts("2FRGLDX9FA.com.Azor255588.Azor"), {
+    appIdPrefix: "2FRGLDX9FA",
+    profileBundlePattern: "com.Azor255588.Azor",
+  });
+  assert.deepEqual(getApplicationIdentifierParts("OLDPREFIX99.com.example.*"), {
+    appIdPrefix: "OLDPREFIX99",
+    profileBundlePattern: "com.example.*",
+  });
+  assert.equal(getApplicationIdentifierParts("missing-separator"), null);
+});
+
+test("preserves the IPA original Bundle ID and rejects requested rewrites", () => {
+  assert.equal(assertOriginalBundleIdentifier("p3.xyz.yyyue.esign", ""), "p3.xyz.yyyue.esign");
+  assert.equal(assertOriginalBundleIdentifier("p3.xyz.yyyue.esign", "p3.xyz.yyyue.esign"), "p3.xyz.yyyue.esign");
+  assert.throws(
+    () => assertOriginalBundleIdentifier("p3.xyz.yyyue.esign", "com.Azor255588.Azor"),
+    (error) => error.code === "BUNDLE_ID_OVERRIDE_DISABLED" &&
+      error.details.sourceBundleIdentifier === "p3.xyz.yyyue.esign" &&
+      error.details.requestedBundleIdentifier === "com.Azor255588.Azor",
+  );
+});
+
+test("mismatch diagnostics explain the exact profile pattern and preserve-source policy", () => {
+  assert.throws(
+    () => assertBundleIdentifierAllowed(
+      "2FRGLDX9FA.com.Azor255588.Azor",
+      "p3.xyz.yyyue.esign",
+      { profileName: "Azor Profile", profileUuid: "PROFILE-UUID", teamIdentifiers: ["2FRGLDX9FA"] },
+    ),
+    (error) => error.code === "BUNDLE_ID_PROFILE_MISMATCH" &&
+      error.details.appIdPrefix === "2FRGLDX9FA" &&
+      error.details.profileBundlePattern === "com.Azor255588.Azor" &&
+      error.details.sourceBundleIdentifier === "p3.xyz.yyyue.esign" &&
+      error.details.profileName === "Azor Profile" &&
+      error.details.policy === "PRESERVE_SOURCE_BUNDLE_ID" &&
+      error.details.nextAction === "DOWNLOAD_MATCHING_PROVISIONING_PROFILE_FROM_APPLE_DEVELOPER",
+  );
+});
+
+test("requires the P12 certificate fingerprint to be present in DeveloperCertificates", () => {
+  const certificateBytes = Buffer.from([0x30, 0x03, 0x02, 0x01, 0x01]);
+  const fingerprint = (crypto.createHash("sha256").update(certificateBytes).digest("hex"));
+  assert.equal(assertSigningCertificateInProfile({ DeveloperCertificates: [certificateBytes] }, [fingerprint]), true);
+  assert.throws(
+    () => assertSigningCertificateInProfile({ DeveloperCertificates: [certificateBytes] }, ["00".repeat(32)]),
+    (error) => error.code === "SIGNING_CERTIFICATE_NOT_IN_PROFILE" && error.details.matchingCertificate === false,
+  );
+});
 
 test("keeps Ad Hoc and Development device restrictions when no target UDID is supplied", () => {
   const adHoc = classifyProvisioningProfile(adhocProfile());

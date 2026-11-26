@@ -28,6 +28,7 @@ COPY package.json ./package.json
 RUN npm install --omit=dev --no-audit --no-fund
 COPY src ./src
 COPY --from=zsign-builder /src/zsign/bin/zsign /usr/local/bin/zsign
+COPY --from=zsign-builder /src/zsign/LICENSE /usr/share/doc/zsign/LICENSE
 ENV ZSIGN_BIN=/usr/local/bin/zsign
 # Verify the copied binary and all dynamic libraries during image build,
 # so a broken image cannot be deployed as a seemingly healthy worker.

@@ -48,9 +48,13 @@ Health check sẵn sàng chỉ khi có:
   "zsign": true,
   "blob": true,
   "signBlob": true,
+  "signingPolicy": "PRESERVE_SOURCE_BUNDLE_ID",
+  "profileEntitlementPreflight": true,
+  "signingCertificatePreflight": true,
+  "zsignSource": "https://github.com/zhlynn/zsign",
   "corsConfigured": true,
   "firebaseProjectId": "your-firebase-project-id",
-  "build": "ipa-signing-profile-plist-payload-fix-2026-11-26",
+  "build": "ipa-signing-preserve-original-bundle-id-zsign-preflight-2026-11-26",
   "zsignVersion": "..."
 }
 ```
@@ -116,7 +120,9 @@ If decoding fails, Runtime Logs include the OpenSSL strategy, exit code and a sh
 
 Test locally with `npm test`; the CMS decoder tests generate a temporary synthetic profile signed by a disposable test certificate and never use production credentials.
 
-Expected Worker health build: `ipa-signing-pkcs12-reader-fix-2026-11-19`.
+Expected Worker health build: `ipa-signing-preserve-original-bundle-id-zsign-preflight-2026-11-26`.
+
+The Worker preserves the original `CFBundleIdentifier` from the IPA and does not pass ZSign `-b`. Before quota consumption, it checks that the profile `application-identifier` covers that Bundle ID and that the public signing certificate in P12/PFX is listed in the profile `DeveloperCertificates`. If the profile App ID is different, use a profile for the IPA original Bundle ID; the Worker does not rewrite the Apple-signed authorization. See `PRESERVE-ORIGINAL-BUNDLE-ID-PREFLIGHT-2026-11-26.md`.
 
 
 ## Provisioning profile plist payload compatibility (2026-11-26)
